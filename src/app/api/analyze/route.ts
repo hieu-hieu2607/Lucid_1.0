@@ -3,9 +3,6 @@ import { runAnalysis, DEFAULT_UNIVERSE } from "@/lib/analyze";
 
 // Cần Node runtime (không phải Edge) vì vnstock-js dùng các API Node chuẩn.
 export const runtime = "nodejs";
-// Dữ liệu thị trường đổi liên tục — không cache tĩnh ở build time.
-export const dynamic = "force-dynamic";
-export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
