@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: var(--font-body);
+  --font-display: var(--font-display);
+  --font-mono: var(--font-mono);
+}
+
+body {
+  background: #0a0d12;
+  color: #e7eaee;
+  font-family: var(--font-body), sans-serif;
+}
+
+::selection {
+  background: #16c78440;
+}
+
+/* thanh cuộn mảnh, hợp phong cách terminal */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #262c36;
+  border-radius: 4px;
+}
