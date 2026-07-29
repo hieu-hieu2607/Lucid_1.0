@@ -1,6 +1,6 @@
 import { stock, init, rsi, macd } from "vnstock-js";
 import os from "os";
-import path from "path";
+import { getVnstock } from "./vnstock-client";
 
 // Rổ mã mặc định để quét — có thể mở rộng sau (VN30 tiêu biểu, thanh khoản tốt)
 export const DEFAULT_UNIVERSE = [
@@ -40,6 +40,7 @@ function pctChange(from: number, to: number): number {
  */
 async function scoreShortTerm(ticker: string): Promise<ShortTermResult | null> {
   try {
+    const { stock, rsi, macd } = await getVnstock();
     const start = new Date();
     start.setDate(start.getDate() - 120); // ~4 tháng dữ liệu để tính chỉ báo ổn định
 
@@ -127,6 +128,7 @@ async function scoreShortTerm(ticker: string): Promise<ShortTermResult | null> {
  */
 async function screenLongTerm(): Promise<LongTermResult[]> {
   try {
+    const { stock } = await getVnstock();
     const screened = await stock.screening({
       exchange: "HOSE",
       filters: [
@@ -170,8 +172,8 @@ async function screenLongTerm(): Promise<LongTermResult[]> {
 }
 
 export async function runAnalysis(universe: string[] = DEFAULT_UNIVERSE) {
+  const { init } = await getVnstock();
   await init({ cacheDir: path.join(os.tmpdir(), "vnstock-js-cache") });
-
   const shortTermSettled = await Promise.all(
     universe.map((t) => scoreShortTerm(t))
   );
