@@ -5,27 +5,25 @@ import { useEffect, useState } from "react";
 interface ShortTermResult {
   ticker: string;
   score: number;
+  lastClose: number | null;
   rsi14: number | null;
   macdHistogram: number | null;
+  macdRising: boolean | null;
+  sma20: number | null;
+  sma50: number | null;
+  priceVsSma20Pct: number | null;
+  trendAligned: boolean | null;
+  superTrend: "bullish" | "bearish" | null;
+  bollingerPercentB: number | null;
+  atrPercent: number | null;
   volumeRatio: number | null;
   priceChange5d: number | null;
-  lastClose: number | null;
-  reason: string;
-}
-
-interface LongTermResult {
-  ticker: string;
-  score: number;
-  pe: number | null;
-  roe: number | null;
-  marketCap: number | null;
   reason: string;
 }
 
 interface AnalysisResponse {
   generatedAt: string;
   shortTerm: { best: ShortTermResult | null; ranked: ShortTermResult[] };
-  longTerm: { best: LongTermResult | null; ranked: LongTermResult[] };
 }
 
 function fmt(n: number | null | undefined, digits = 1): string {
@@ -33,46 +31,53 @@ function fmt(n: number | null | undefined, digits = 1): string {
   return n.toFixed(digits);
 }
 
+const ACCENT = "#16C784";
+const DOWN = "#EA3943";
+
 export default function Home() {
   const [data, setData] = useState<AnalysisResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
- async function load() {
-  setLoading(true);
-  setError(null);
-  try {
-    const res = await fetch("/api/analyze");
-    const text = await res.text();
-    let json: any;
+  async function load() {
+    setLoading(true);
+    setError(null);
     try {
-      json = JSON.parse(text);
-    } catch {
-      throw new Error(`Server trả về dữ liệu không hợp lệ (status ${res.status}): ${text.slice(0, 200)}`);
+      const res = await fetch("/api/analyze");
+      const text = await res.text();
+      let json: any;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        throw new Error(
+          `Server trả về dữ liệu không hợp lệ (status ${res.status}): ${text.slice(0, 200)}`
+        );
+      }
+      if (!res.ok) throw new Error(json.error ?? "Lỗi tải dữ liệu");
+      setData(json);
+    } catch (e: any) {
+      setError(e.message ?? "Có lỗi xảy ra");
+    } finally {
+      setLoading(false);
     }
-    if (!res.ok) throw new Error(json.error ?? "Lỗi tải dữ liệu");
-    setData(json);
-  } catch (e: any) {
-    setError(e.message ?? "Có lỗi xảy ra");
-  } finally {
-    setLoading(false);
   }
-}
 
   useEffect(() => {
     load();
   }, []);
 
+  const best = data?.shortTerm.best ?? null;
+  const ranked = data?.shortTerm.ranked ?? [];
+
   return (
     <main className="flex-1 flex flex-col">
-      {/* Header */}
       <header className="border-b border-[#1F252E] px-6 py-5 flex items-center justify-between">
         <div>
           <h1 className="font-[var(--font-display)] text-xl font-bold tracking-tight">
             Song Kiếm
           </h1>
           <p className="text-sm text-[#7C8797] mt-0.5">
-            Một mã để lướt sóng. Một mã để nắm giữ dài hạn.
+            Mã tốt nhất để lướt sóng — xu hướng, động lượng, biến động, khối lượng.
           </p>
         </div>
         <button
@@ -90,194 +95,142 @@ export default function Home() {
         </div>
       )}
 
-      {/* Split screen: lướt sóng (xanh) vs dài hạn (vàng) */}
-      <div className="flex-1 grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-[#1F252E]">
-        <Panel
-          accent="#16C784"
-          label="LƯỚT SÓNG"
-          sublabel="Momentum kỹ thuật · ngắn hạn"
-          loading={loading}
-        >
-          {data?.shortTerm.best && (
-            <BestCard
-              accent="#16C784"
-              ticker={data.shortTerm.best.ticker}
-              score={data.shortTerm.best.score}
-              reason={data.shortTerm.best.reason}
-              stats={[
-                ["Giá đóng cửa", data.shortTerm.best.lastClose ? `${fmt(data.shortTerm.best.lastClose)}k` : "—"],
-                ["RSI (14)", fmt(data.shortTerm.best.rsi14)],
-                ["MACD hist.", fmt(data.shortTerm.best.macdHistogram, 2)],
-                ["KL / TB20", data.shortTerm.best.volumeRatio ? `${fmt(data.shortTerm.best.volumeRatio, 2)}x` : "—"],
-                ["Δ giá 5 phiên", `${fmt(data.shortTerm.best.priceChange5d)}%`],
-              ]}
-            />
-          )}
-          {data && (
-            <RankedTable
-              rows={data.shortTerm.ranked}
-              columns={["ticker", "score", "rsi14", "priceChange5d"]}
-              headers={["Mã", "Điểm", "RSI", "Δ 5 phiên"]}
-            />
-          )}
-        </Panel>
+      <section className="p-6 flex flex-col gap-6 max-w-5xl w-full mx-auto">
+        <div className="flex items-baseline gap-2">
+          <span
+            className="text-xs font-semibold tracking-[0.15em] font-[var(--font-mono)]"
+            style={{ color: ACCENT }}
+          >
+            LƯỚT SÓNG
+          </span>
+          <span className="text-xs text-[#5A6270]">
+            Xu hướng (SMA/SuperTrend) · Động lượng (RSI/MACD) · Biến động (Bollinger/ATR) · Khối lượng
+          </span>
+        </div>
 
-        <Panel
-          accent="#F0B90B"
-          label="DÀI HẠN"
-          sublabel="Nền tảng cơ bản · P/E &amp; ROE"
-          loading={loading}
-        >
-          {data?.longTerm.best && (
-            <BestCard
-              accent="#F0B90B"
-              ticker={data.longTerm.best.ticker}
-              score={data.longTerm.best.score}
-              reason={data.longTerm.best.reason}
-              stats={[
-                ["P/E", fmt(data.longTerm.best.pe)],
-                ["ROE", data.longTerm.best.roe ? `${fmt(data.longTerm.best.roe * 100)}%` : "—"],
-              ]}
-            />
-          )}
-          {data && (
-            <RankedTable
-              rows={data.longTerm.ranked}
-              columns={["ticker", "score", "pe", "roe"]}
-              headers={["Mã", "Điểm", "P/E", "ROE"]}
-            />
-          )}
-        </Panel>
-      </div>
+        {loading && !best && (
+          <div className="text-sm text-[#5A6270] font-[var(--font-mono)] animate-pulse">
+            Đang tải dữ liệu…
+          </div>
+        )}
+
+        {best && (
+          <div
+            className="rounded-xl border p-5 flex flex-col gap-4"
+            style={{ borderColor: `${ACCENT}40`, background: `${ACCENT}0D` }}
+          >
+            <div className="flex items-start justify-between flex-wrap gap-3">
+              <div>
+                <div className="text-3xl font-[var(--font-display)] font-bold">
+                  {best.ticker}
+                </div>
+                <p className="text-sm text-[#9AA4B2] mt-1 max-w-2xl">{best.reason}</p>
+              </div>
+              <div className="text-right shrink-0">
+                <div
+                  className="text-4xl font-[var(--font-mono)] font-bold"
+                  style={{ color: ACCENT }}
+                >
+                  {best.score}
+                </div>
+                <div className="text-xs text-[#5A6270]">điểm / 100</div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <Stat label="Giá đóng cửa" value={best.lastClose ? `${fmt(best.lastClose)}k` : "—"} />
+              <Stat
+                label="Xu hướng SMA20/50"
+                value={best.trendAligned === null ? "—" : best.trendAligned ? "Thuận" : "Chưa thuận"}
+                color={best.trendAligned === true ? ACCENT : best.trendAligned === false ? DOWN : undefined}
+              />
+              <Stat
+                label="SuperTrend"
+                value={best.superTrend === "bullish" ? "Tăng" : best.superTrend === "bearish" ? "Giảm" : "—"}
+                color={best.superTrend === "bullish" ? ACCENT : best.superTrend === "bearish" ? DOWN : undefined}
+              />
+              <Stat label="Giá vs SMA20" value={best.priceVsSma20Pct !== null ? `${fmt(best.priceVsSma20Pct)}%` : "—"} />
+              <Stat label="RSI (14)" value={fmt(best.rsi14)} />
+              <Stat
+                label="MACD hist."
+                value={`${fmt(best.macdHistogram, 2)}${best.macdRising ? " ↑" : ""}`}
+              />
+              <Stat label="Bollinger %B" value={fmt(best.bollingerPercentB, 2)} />
+              <Stat label="ATR / giá" value={best.atrPercent !== null ? `${fmt(best.atrPercent)}%` : "—"} />
+              <Stat label="KL / TB20" value={best.volumeRatio ? `${fmt(best.volumeRatio, 2)}x` : "—"} />
+              <Stat label="Δ giá 5 phiên" value={`${fmt(best.priceChange5d)}%`} />
+            </div>
+          </div>
+        )}
+
+        {ranked.length > 0 && (
+          <div className="overflow-x-auto rounded-lg border border-[#1F252E]">
+            <table className="w-full text-sm font-[var(--font-mono)]">
+              <thead>
+                <tr className="text-[#5A6270] text-xs">
+                  {["Mã", "Điểm", "RSI", "MACD", "Xu hướng", "%B", "ATR%", "KL/TB20", "Δ 5 phiên"].map((h) => (
+                    <th key={h} className="text-left font-normal px-3 py-2 border-b border-[#1F252E]">
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {ranked.map((row, i) => (
+                  <tr key={row.ticker + i} className="border-b border-[#161B22] last:border-0">
+                    <td className="px-3 py-2 text-[#E7EAEE] font-semibold">{row.ticker}</td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">{row.score}</td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">{fmt(row.rsi14)}</td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">
+                      {fmt(row.macdHistogram, 2)}
+                      {row.macdRising ? " ↑" : ""}
+                    </td>
+                    <td
+                      className="px-3 py-2"
+                      style={{
+                        color:
+                          row.trendAligned === true
+                            ? ACCENT
+                            : row.trendAligned === false
+                            ? DOWN
+                            : "#C4CBD4",
+                      }}
+                    >
+                      {row.trendAligned === null ? "—" : row.trendAligned ? "Thuận" : "Chưa thuận"}
+                    </td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">{fmt(row.bollingerPercentB, 2)}</td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">
+                      {row.atrPercent !== null ? `${fmt(row.atrPercent)}%` : "—"}
+                    </td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">
+                      {row.volumeRatio ? `${fmt(row.volumeRatio, 2)}x` : "—"}
+                    </td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">{fmt(row.priceChange5d)}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
 
       <footer className="border-t border-[#1F252E] px-6 py-3 text-xs text-[#5A6270] flex items-center justify-between">
         <span>
           {data ? `Cập nhật lúc ${new Date(data.generatedAt).toLocaleTimeString("vi-VN")}` : ""}
         </span>
-        <span>Chỉ mang tính tham khảo kỹ thuật/cơ bản — không phải khuyến nghị đầu tư.</span>
+        <span>Chỉ mang tính tham khảo kỹ thuật — không phải khuyến nghị đầu tư.</span>
       </footer>
     </main>
   );
 }
 
-function Panel({
-  accent,
-  label,
-  sublabel,
-  loading,
-  children,
-}: {
-  accent: string;
-  label: string;
-  sublabel: string;
-  loading: boolean;
-  children: React.ReactNode;
-}) {
+function Stat({ label, value, color }: { label: string; value: string; color?: string }) {
   return (
-    <section className="p-6 flex flex-col gap-5">
-      <div className="flex items-baseline gap-2">
-        <span
-          className="text-xs font-semibold tracking-[0.15em] font-[var(--font-mono)]"
-          style={{ color: accent }}
-        >
-          {label}
-        </span>
-        <span className="text-xs text-[#5A6270]">{sublabel}</span>
-      </div>
-      {loading && !children && (
-        <div className="text-sm text-[#5A6270] font-[var(--font-mono)] animate-pulse">
-          Đang tải dữ liệu…
-        </div>
-      )}
-      {children}
-    </section>
-  );
-}
-
-function BestCard({
-  accent,
-  ticker,
-  score,
-  reason,
-  stats,
-}: {
-  accent: string;
-  ticker: string;
-  score: number;
-  reason: string;
-  stats: [string, string][];
-}) {
-  return (
-    <div
-      className="rounded-xl border p-5 flex flex-col gap-4"
-      style={{ borderColor: `${accent}40`, background: `${accent}0D` }}
-    >
-      <div className="flex items-start justify-between">
-        <div>
-          <div className="text-3xl font-[var(--font-display)] font-bold">{ticker}</div>
-          <p className="text-sm text-[#9AA4B2] mt-1 max-w-md">{reason}</p>
-        </div>
-        <div className="text-right shrink-0">
-          <div className="text-4xl font-[var(--font-mono)] font-bold" style={{ color: accent }}>
-            {score}
-          </div>
-          <div className="text-xs text-[#5A6270]">điểm / 100</div>
-        </div>
-      </div>
-      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-        {stats.map(([k, v]) => (
-          <div key={k} className="rounded-md bg-black/20 px-3 py-2">
-            <div className="text-[10px] uppercase tracking-wide text-[#5A6270]">{k}</div>
-            <div className="font-[var(--font-mono)] text-sm mt-0.5">{v}</div>
-          </div>
-        ))}
+    <div className="rounded-md bg-black/20 px-3 py-2">
+      <div className="text-[10px] uppercase tracking-wide text-[#5A6270]">{label}</div>
+      <div className="font-[var(--font-mono)] text-sm mt-0.5" style={color ? { color } : undefined}>
+        {value}
       </div>
     </div>
   );
-}
-
-function RankedTable<T extends Record<string, any>>({
-  rows,
-  columns,
-  headers,
-}: {
-  rows: T[];
-  columns: (keyof T)[];
-  headers: string[];
-}) {
-  if (!rows.length) return null;
-  return (
-    <div className="overflow-x-auto rounded-lg border border-[#1F252E]">
-      <table className="w-full text-sm font-[var(--font-mono)]">
-        <thead>
-          <tr className="text-[#5A6270] text-xs">
-            {headers.map((h) => (
-              <th key={h} className="text-left font-normal px-3 py-2 border-b border-[#1F252E]">
-                {h}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row, i) => (
-            <tr key={row.ticker + i} className="border-b border-[#161B22] last:border-0">
-              {columns.map((col) => (
-                <td key={String(col)} className="px-3 py-2 text-[#C4CBD4]">
-                  {formatCell(col as string, row[col])}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function formatCell(col: string, value: any): string {
-  if (value === null || value === undefined) return "—";
-  if (col === "roe") return `${fmt(value * 100)}%`;
-  if (col === "priceChange5d") return `${fmt(value)}%`;
-  if (typeof value === "number") return fmt(value, col === "score" ? 0 : 1);
-  return String(value);
 }
