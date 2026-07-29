@@ -32,7 +32,26 @@ function pctChange(from: number, to: number): number {
   if (!from) return 0;
   return ((to - from) / from) * 100;
 }
+/** Giờ Việt Nam hiện tại có đang trong phiên giao dịch không (9h-15h, T2-T6)? */
+function isVnMarketHoursNow(): boolean {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Ho_Chi_Minh",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    weekday: "short",
+  }).formatToParts(new Date());
+  const map: Record<string, string> = {};
+  parts.forEach((p) => (map[p.type] = p.value));
+  const minutesNow = parseInt(map.hour, 10) * 60 + parseInt(map.minute, 10);
+  const isWeekday = map.weekday !== "Sat" && map.weekday !== "Sun";
+  return isWeekday && minutesNow >= 9 * 60 && minutesNow < 15 * 60;
+}
 
+/** Ngày hôm nay theo giờ Việt Nam, dạng YYYY-MM-DD. */
+function vnTodayDateString(): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Ho_Chi_Minh" }).format(new Date());
+}
 /**
  * Chấm điểm momentum ngắn hạn cho 1 mã, tổng hợp nhiều chiều:
  * xu hướng (SMA20/50 + SuperTrend), động lượng (RSI/MACD), biến động
@@ -46,10 +65,24 @@ async function scoreShortTerm(ticker: string): Promise<ShortTermResult | null> {
     const start = new Date();
     start.setDate(start.getDate() - 150); // ~5 tháng để SMA50/ATR đủ dữ liệu ổn định
 
-    const history = await stock.quote({
+    let history = await stock.quote({
       ticker,
       start: start.toISOString().slice(0, 10),
     });
+
+    if (!history || history.length < 55) return null;
+
+    // Trong giờ giao dịch, nến "hôm nay" vẫn đang hình thành (giá đóng cửa tạm
+    // thời cập nhật liên tục) — dùng nó để tính RSI/MACD/SMA/Bollinger sẽ khiến
+    // điểm số nhảy loạn suốt phiên. Bỏ nến này đi, chỉ tính trên các phiên đã
+    // đóng cửa thực sự; điểm số sẽ chỉ đổi 1 lần/ngày, sau khi thị trường đóng cửa.
+    if (isVnMarketHoursNow()) {
+      const today = vnTodayDateString();
+      const last = history.at(-1);
+      if (last && String(last.date).slice(0, 10) === today) {
+        history = history.slice(0, -1);
+      }
+    }
 
     if (!history || history.length < 55) return null;
 
