@@ -1,4 +1,6 @@
 import { stock, init, rsi, macd } from "vnstock-js";
+import os from "os";
+import path from "path";
 
 // Rổ mã mặc định để quét — có thể mở rộng sau (VN30 tiêu biểu, thanh khoản tốt)
 export const DEFAULT_UNIVERSE = [
@@ -168,7 +170,7 @@ async function screenLongTerm(): Promise<LongTermResult[]> {
 }
 
 export async function runAnalysis(universe: string[] = DEFAULT_UNIVERSE) {
-  await init();
+  await init({ cacheDir: path.join(os.tmpdir(), "vnstock-js-cache") });
 
   const shortTermSettled = await Promise.all(
     universe.map((t) => scoreShortTerm(t))
