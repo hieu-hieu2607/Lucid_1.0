@@ -1,5 +1,6 @@
 import { stock, init, rsi, macd } from "vnstock-js";
 import os from "os";
+import path from "path";
 import { getVnstock } from "./vnstock-client";
 
 // Rổ mã mặc định để quét — có thể mở rộng sau (VN30 tiêu biểu, thanh khoản tốt)
