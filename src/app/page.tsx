@@ -38,19 +38,26 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  async function load() {
-    setLoading(true);
-    setError(null);
+ async function load() {
+  setLoading(true);
+  setError(null);
+  try {
+    const res = await fetch("/api/analyze");
+    const text = await res.text();
+    let json: any;
     try {
-      const res = await fetch("/api/analyze");
-      if (!res.ok) throw new Error((await res.json()).error ?? "Lỗi tải dữ liệu");
-      setData(await res.json());
-    } catch (e: any) {
-      setError(e.message ?? "Có lỗi xảy ra");
-    } finally {
-      setLoading(false);
+      json = JSON.parse(text);
+    } catch {
+      throw new Error(`Server trả về dữ liệu không hợp lệ (status ${res.status}): ${text.slice(0, 200)}`);
     }
+    if (!res.ok) throw new Error(json.error ?? "Lỗi tải dữ liệu");
+    setData(json);
+  } catch (e: any) {
+    setError(e.message ?? "Có lỗi xảy ra");
+  } finally {
+    setLoading(false);
   }
+}
 
   useEffect(() => {
     load();
