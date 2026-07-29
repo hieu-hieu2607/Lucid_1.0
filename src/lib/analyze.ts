@@ -1,4 +1,3 @@
-import { stock, init, rsi, macd } from "vnstock-js";
 import os from "os";
 import path from "path";
 import { getVnstock } from "./vnstock-client";
@@ -13,20 +12,19 @@ export const DEFAULT_UNIVERSE = [
 export interface ShortTermResult {
   ticker: string;
   score: number;
+  lastClose: number | null;
   rsi14: number | null;
   macdHistogram: number | null;
+  macdRising: boolean | null; // histogram đang tăng dần (động lượng tăng tốc)
+  sma20: number | null;
+  sma50: number | null;
+  priceVsSma20Pct: number | null; // giá lệch SMA20 bao nhiêu %
+  trendAligned: boolean | null; // giá > SMA20 > SMA50 (xu hướng tăng rõ ràng)
+  superTrend: "bullish" | "bearish" | null;
+  bollingerPercentB: number | null; // vị trí trong dải Bollinger (0=dải dưới, 1=dải trên)
+  atrPercent: number | null; // ATR / giá — đo biến động tương đối (rủi ro)
   volumeRatio: number | null; // volume gần nhất / TB 20 phiên
   priceChange5d: number | null; // % thay đổi giá 5 phiên gần nhất
-  lastClose: number | null;
-  reason: string;
-}
-
-export interface LongTermResult {
-  ticker: string;
-  score: number;
-  pe: number | null;
-  roe: number | null;
-  marketCap: number | null;
   reason: string;
 }
 
@@ -36,86 +34,187 @@ function pctChange(from: number, to: number): number {
 }
 
 /**
- * Chấm điểm momentum ngắn hạn cho 1 mã dựa trên RSI, MACD, volume, biến động giá.
- * Đây KHÔNG phải khuyến nghị đầu tư — chỉ là tổng hợp chỉ báo kỹ thuật lịch sử.
+ * Chấm điểm momentum ngắn hạn cho 1 mã, tổng hợp nhiều chiều:
+ * xu hướng (SMA20/50 + SuperTrend), động lượng (RSI/MACD), biến động
+ * (Bollinger %B, ATR), và xác nhận dòng tiền (khối lượng).
+ *
+ * Đây KHÔNG phải khuyến nghị đầu tư — chỉ tổng hợp chỉ báo kỹ thuật lịch sử.
  */
 async function scoreShortTerm(ticker: string): Promise<ShortTermResult | null> {
   try {
-    const { stock, rsi, macd } = await getVnstock();
+    const { stock, rsi, macd, sma, bollinger, atr, superTrend } = await getVnstock();
     const start = new Date();
-    start.setDate(start.getDate() - 120); // ~4 tháng dữ liệu để tính chỉ báo ổn định
+    start.setDate(start.getDate() - 150); // ~5 tháng để SMA50/ATR đủ dữ liệu ổn định
 
     const history = await stock.quote({
       ticker,
       start: start.toISOString().slice(0, 10),
     });
 
-    if (!history || history.length < 30) return null;
+    if (!history || history.length < 55) return null;
 
     const rsiSeries = rsi(history);
     const macdSeries = macd(history);
+    const sma20Series = sma(history, { period: 20 });
+    const sma50Series = sma(history, { period: 50 });
+    const bbSeries = bollinger(history, { period: 20, stddev: 2 });
+    const atrSeries = atr(history, 14);
+    const stSeries = superTrend(history);
 
     const lastRsi = rsiSeries?.at(-1)?.rsi ?? null;
-    const lastMacd = macdSeries?.at(-1);
-    const macdHistogram = lastMacd?.histogram ?? null;
 
-    const recent = history.slice(-20);
+    const lastMacd = macdSeries?.at(-1)?.histogram ?? null;
+    const prevMacd = macdSeries?.at(-4)?.histogram ?? null; // so với 3 phiên trước
+    const macdHistogram = lastMacd;
+    const macdRising =
+      lastMacd !== null && prevMacd !== null ? lastMacd > prevMacd : null;
+
+    const closeNow = history.at(-1)?.close ?? 0;
+    const sma20 = sma20Series?.at(-1)?.sma ?? null;
+    const sma50 = sma50Series?.at(-1)?.sma ?? null;
+    const priceVsSma20Pct = sma20 ? pctChange(sma20, closeNow) : null;
+    const trendAligned =
+      sma20 !== null && sma50 !== null
+        ? closeNow > sma20 && sma20 > sma50
+        : null;
+
+    const superTrendDirection = stSeries?.at(-1)?.direction ?? null;
+
+    const bollingerPercentB = bbSeries?.at(-1)?.percentB ?? null;
+
+    const lastAtr = atrSeries?.at(-1)?.atr ?? null;
+    const atrPercent = lastAtr && closeNow ? (lastAtr / closeNow) * 100 : null;
+
+    const recent20 = history.slice(-20);
     const avgVol20 =
-      recent.reduce((sum, r) => sum + r.volume, 0) / recent.length;
+      recent20.reduce((sum, r) => sum + r.volume, 0) / recent20.length;
     const lastVol = history.at(-1)?.volume ?? 0;
     const volumeRatio = avgVol20 > 0 ? lastVol / avgVol20 : null;
 
-    const closeNow = history.at(-1)?.close ?? 0;
     const close5dAgo = history.at(-6)?.close ?? closeNow;
     const priceChange5d = pctChange(close5dAgo, closeNow);
 
-    // --- Chấm điểm momentum (0-100), trọng số có thể tinh chỉnh sau ---
+    // --- Chấm điểm 0-100, cộng dồn theo từng dải giá trị cụ thể ---
     let score = 50;
     const reasons: string[] = [];
 
-    if (lastRsi !== null) {
-      if (lastRsi >= 50 && lastRsi <= 70) {
-        score += 20;
-        reasons.push(`RSI ${lastRsi.toFixed(1)} trong vùng xu hướng tăng khỏe`);
-      } else if (lastRsi > 70) {
-        score += 5;
-        reasons.push(`RSI ${lastRsi.toFixed(1)} đã vào vùng quá mua`);
-      } else if (lastRsi < 30) {
-        score -= 10;
-        reasons.push(`RSI ${lastRsi.toFixed(1)} yếu, có thể đang giảm`);
-      }
+    // 1) Cấu trúc xu hướng: SMA20/50 + SuperTrend (trọng số lớn nhất — xu
+    //    hướng đúng chiều là điều kiện tiên quyết cho lướt sóng an toàn)
+    if (trendAligned === true) {
+      score += 15;
+      reasons.push("Giá > SMA20 > SMA50 (xu hướng tăng rõ ràng)");
+    } else if (trendAligned === false) {
+      score -= 15;
+      reasons.push("Cấu trúc SMA cho thấy xu hướng chưa thuận lợi");
+    }
+    if (superTrendDirection === "bullish") {
+      score += 10;
+      reasons.push("SuperTrend xác nhận xu hướng tăng");
+    } else if (superTrendDirection === "bearish") {
+      score -= 10;
+      reasons.push("SuperTrend đang ở chiều giảm");
     }
 
-    if (macdHistogram !== null) {
-      if (macdHistogram > 0) {
+    // 2) RSI — vùng động lượng khỏe mà chưa quá mua
+    if (lastRsi !== null) {
+      if (lastRsi >= 50 && lastRsi <= 65) {
         score += 15;
-        reasons.push("MACD histogram dương, động lượng tăng");
+        reasons.push(`RSI ${lastRsi.toFixed(1)} trong vùng động lượng khỏe`);
+      } else if (lastRsi > 65 && lastRsi <= 72) {
+        score += 6;
+        reasons.push(`RSI ${lastRsi.toFixed(1)} mạnh nhưng gần vùng quá mua`);
+      } else if (lastRsi > 72) {
+        score -= 8;
+        reasons.push(`RSI ${lastRsi.toFixed(1)} quá mua, rủi ro điều chỉnh`);
+      } else if (lastRsi >= 40) {
+        score += 3;
       } else {
         score -= 10;
-        reasons.push("MACD histogram âm, động lượng yếu");
+        reasons.push(`RSI ${lastRsi.toFixed(1)} yếu`);
       }
     }
 
-    if (volumeRatio !== null && volumeRatio > 1.3) {
-      score += 15;
-      reasons.push(`Khối lượng gấp ${volumeRatio.toFixed(1)}x trung bình 20 phiên`);
+    // 3) MACD — động lượng có đang tăng tốc không, không chỉ dương/âm
+    if (macdHistogram !== null) {
+      if (macdHistogram > 0 && macdRising) {
+        score += 15;
+        reasons.push("MACD dương và đang tăng tốc");
+      } else if (macdHistogram > 0) {
+        score += 7;
+        reasons.push("MACD dương nhưng động lượng chững lại");
+      } else {
+        score -= 10;
+        reasons.push("MACD âm, động lượng yếu");
+      }
     }
 
-    if (priceChange5d > 0) {
-      score += Math.min(priceChange5d * 2, 15);
-      reasons.push(`Giá tăng ${priceChange5d.toFixed(1)}% trong 5 phiên`);
+    // 4) Bollinger %B — vị trí trong dải, tránh mua đuổi khi đã quá dải trên
+    if (bollingerPercentB !== null) {
+      if (bollingerPercentB > 1.0) {
+        score -= 8;
+        reasons.push("Giá vượt dải trên Bollinger, có thể đã quá đà");
+      } else if (bollingerPercentB >= 0.5) {
+        score += 10;
+        reasons.push("Giá ở nửa trên dải Bollinger, còn dư địa tăng");
+      } else if (bollingerPercentB >= 0.2) {
+        score += 2;
+      } else {
+        score -= 8;
+        reasons.push("Giá gần dải dưới Bollinger, xu hướng yếu");
+      }
+    }
+
+    // 5) Khối lượng xác nhận
+    if (volumeRatio !== null) {
+      if (volumeRatio > 1.5) {
+        score += 15;
+        reasons.push(`Khối lượng gấp ${volumeRatio.toFixed(1)}x TB 20 phiên`);
+      } else if (volumeRatio > 1.2) {
+        score += 8;
+        reasons.push(`Khối lượng cao hơn ${((volumeRatio - 1) * 100).toFixed(0)}% TB 20 phiên`);
+      } else if (volumeRatio < 0.8) {
+        score -= 5;
+      }
+    }
+
+    // 6) Biến động giá 5 phiên — tăng khỏe nhưng chưa quá "đuổi giá"
+    if (priceChange5d > 2 && priceChange5d <= 8) {
+      score += 10;
+      reasons.push(`Giá tăng ${priceChange5d.toFixed(1)}% trong 5 phiên, nhịp tăng khỏe`);
+    } else if (priceChange5d > 8 && priceChange5d <= 15) {
+      score += 4;
+      reasons.push(`Giá tăng ${priceChange5d.toFixed(1)}%, bắt đầu hơi nóng`);
+    } else if (priceChange5d > 15) {
+      score -= 5;
+      reasons.push(`Giá tăng nóng ${priceChange5d.toFixed(1)}% trong 5 phiên, rủi ro đuổi giá`);
+    } else if (priceChange5d >= 0) {
+      score += 3;
     } else {
       score -= 5;
+    }
+
+    // 7) Rủi ro biến động — ATR quá cao so với giá làm việc canh điểm vào/ra khó hơn
+    if (atrPercent !== null && atrPercent > 5) {
+      score -= 3;
+      reasons.push(`ATR ${atrPercent.toFixed(1)}% giá — biến động cao, cần quản trị rủi ro chặt`);
     }
 
     return {
       ticker,
       score: Math.round(Math.max(0, Math.min(100, score))),
+      lastClose: closeNow,
       rsi14: lastRsi,
       macdHistogram,
+      macdRising,
+      sma20,
+      sma50,
+      priceVsSma20Pct,
+      trendAligned,
+      superTrend: superTrendDirection,
+      bollingerPercentB,
+      atrPercent,
       volumeRatio,
       priceChange5d,
-      lastClose: closeNow,
       reason: reasons.join("; ") || "Không đủ dữ liệu để đánh giá",
     };
   } catch (err) {
@@ -124,57 +223,11 @@ async function scoreShortTerm(ticker: string): Promise<ShortTermResult | null> {
   }
 }
 
-/**
- * Lấy danh sách ứng viên dài hạn dựa trên sàng lọc cơ bản (P/E hợp lý, ROE cao).
- */
-async function screenLongTerm(): Promise<LongTermResult[]> {
-  try {
-    const { stock } = await getVnstock();
-    const screened = await stock.screening({
-      exchange: "HOSE",
-      filters: [
-        { field: "pe", operator: "<", value: 20 },
-        { field: "roe", operator: ">", value: 0.12 },
-      ],
-      sortBy: "roe",
-      order: "desc",
-      limit: 15,
-    });
-
-    return screened.map((row) => {
-      const pe = (row as Record<string, any>).pe ?? null;
-      const roe = (row as Record<string, any>).roe ?? null;
-      let score = 50;
-      const reasons: string[] = [];
-
-      if (roe !== null) {
-        score += Math.min(roe * 100, 30); // ROE 0.20 => +20 điểm
-        reasons.push(`ROE ${(roe * 100).toFixed(1)}%`);
-      }
-      if (pe !== null && pe > 0) {
-        score += Math.max(20 - pe, 0); // P/E càng thấp càng cộng điểm (đến ngưỡng 20)
-        reasons.push(`P/E ${pe.toFixed(1)}`);
-      }
-
-      const r = row as Record<string, any>;
-      return {
-        ticker: r.ticker ?? r.symbol,
-        score: Math.round(Math.max(0, Math.min(100, score))),
-        pe,
-        roe,
-        marketCap: r.marketCap ?? null,
-        reason: reasons.join("; ") || "Đạt tiêu chí sàng lọc cơ bản",
-      };
-    });
-  } catch (err) {
-    console.error("screenLongTerm failed:", err);
-    return [];
-  }
-}
-
 export async function runAnalysis(universe: string[] = DEFAULT_UNIVERSE) {
   const { init } = await getVnstock();
+  // os.homedir() không ghi được trên Vercel serverless — chỉ /tmp là ghi được.
   await init({ cacheDir: path.join(os.tmpdir(), "vnstock-js-cache") });
+
   const shortTermSettled = await Promise.all(
     universe.map((t) => scoreShortTerm(t))
   );
@@ -182,19 +235,11 @@ export async function runAnalysis(universe: string[] = DEFAULT_UNIVERSE) {
     .filter((r): r is ShortTermResult => r !== null)
     .sort((a, b) => b.score - a.score);
 
-  const longTermRanked = (await screenLongTerm()).sort(
-    (a, b) => b.score - a.score
-  );
-
   return {
     generatedAt: new Date().toISOString(),
     shortTerm: {
       best: shortTermRanked[0] ?? null,
-      ranked: shortTermRanked.slice(0, 10),
-    },
-    longTerm: {
-      best: longTermRanked[0] ?? null,
-      ranked: longTermRanked.slice(0, 10),
+      ranked: shortTermRanked.slice(0, 15),
     },
   };
 }
