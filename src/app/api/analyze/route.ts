@@ -5,6 +5,9 @@ import { runAnalysis, DEFAULT_UNIVERSE } from "@/lib/analyze";
 export const runtime = "nodejs";
 // Dữ liệu thị trường đổi liên tục — không cache tĩnh ở build time.
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 export async function GET(req: NextRequest) {
   const symbolsParam = req.nextUrl.searchParams.get("symbols");
