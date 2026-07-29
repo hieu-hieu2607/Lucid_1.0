@@ -15,7 +15,7 @@ export async function GET(req: NextRequest) {
   try {
     const result = await runAnalysis(universe);
     return NextResponse.json(result, {
-      headers: { Cache-Control: "s-maxage=900, stale-while-revalidate=300" },
+      headers: { "Cache-Control": "s-maxage=900, stale-while-revalidate=300" },
     });
   } catch (err) {
     console.error("GET /api/analyze failed:", err);
