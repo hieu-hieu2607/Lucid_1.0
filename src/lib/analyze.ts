@@ -9,6 +9,12 @@ export const DEFAULT_UNIVERSE = [
   "GAS", "POW", "SSI", "VRE",
 ];
 
+export interface MarketBreadth {
+  trend: "bull" | "bear" | "neutral";
+  chg1d: number;
+  adjustment: number; // điểm cộng/trừ áp cho toàn bộ watchlist
+}
+
 export interface ShortTermResult {
   ticker: string;
   score: number;
@@ -23,8 +29,13 @@ export interface ShortTermResult {
   superTrend: "bullish" | "bearish" | null;
   bollingerPercentB: number | null; // vị trí trong dải Bollinger (0=dải dưới, 1=dải trên)
   atrPercent: number | null; // ATR / giá — đo biến động tương đối (rủi ro)
+  adx: number | null; // độ mạnh xu hướng (ADX > 25: mạnh, < 20: yếu/đi ngang)
+  adxBullish: boolean | null; // DI+ > DI- (phe mua đang thắng thế)
   volumeRatio: number | null; // volume gần nhất / TB 20 phiên
   priceChange5d: number | null; // % thay đổi giá 5 phiên gần nhất
+  stopLoss: number | null;
+  target1: number | null;
+  riskReward: number | null; // (target1 - giá) / (giá - stopLoss)
   reason: string;
 }
 
@@ -32,6 +43,7 @@ function pctChange(from: number, to: number): number {
   if (!from) return 0;
   return ((to - from) / from) * 100;
 }
+
 /** Giờ Việt Nam hiện tại có đang trong phiên giao dịch không (9h-15h, T2-T6)? */
 function isVnMarketHoursNow(): boolean {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -52,10 +64,121 @@ function isVnMarketHoursNow(): boolean {
 function vnTodayDateString(): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Ho_Chi_Minh" }).format(new Date());
 }
+
+/** Bỏ nến "hôm nay" nếu phiên chưa đóng cửa (xem giải thích ở scoreShortTerm). */
+function trimUnclosedBar<T extends { date: string | Date }>(bars: T[]): T[] {
+  if (!isVnMarketHoursNow()) return bars;
+  const today = vnTodayDateString();
+  const last = bars.at(-1);
+  if (last && String(last.date).slice(0, 10) === today) {
+    return bars.slice(0, -1);
+  }
+  return bars;
+}
+
+/**
+ * ADX / DI+ / DI- (Wilder) — đo ĐỘ MẠNH của xu hướng, không phải chiều xu hướng.
+ * Bổ sung cho SMA/SuperTrend: SMA cho biết đang tăng hay giảm, ADX cho biết xu
+ * hướng đó có "chắc tay" hay chỉ là đi ngang nhiễu. vnstock-js không có sẵn nên
+ * tự tính từ OHLC (công thức Wilder chuẩn, xấp xỉ bằng EMA alpha=1/period).
+ */
+function computeADX(
+  bars: { high: number; low: number; close: number }[],
+  period = 14
+): { adx: number | null; diPlus: number | null; diMinus: number | null } {
+  if (bars.length < period * 2) return { adx: null, diPlus: null, diMinus: null };
+
+  const tr: number[] = [];
+  const plusDM: number[] = [];
+  const minusDM: number[] = [];
+
+  for (let i = 1; i < bars.length; i++) {
+    const upMove = bars[i].high - bars[i - 1].high;
+    const downMove = bars[i - 1].low - bars[i].low;
+    plusDM.push(upMove > downMove && upMove > 0 ? upMove : 0);
+    minusDM.push(downMove > upMove && downMove > 0 ? downMove : 0);
+    tr.push(
+      Math.max(
+        bars[i].high - bars[i].low,
+        Math.abs(bars[i].high - bars[i - 1].close),
+        Math.abs(bars[i].low - bars[i - 1].close)
+      )
+    );
+  }
+
+  const wilderSmooth = (arr: number[]): number[] => {
+    const alpha = 1 / period;
+    const out: number[] = [arr[0]];
+    for (let i = 1; i < arr.length; i++) {
+      out.push(alpha * arr[i] + (1 - alpha) * out[i - 1]);
+    }
+    return out;
+  };
+
+  const atrSm = wilderSmooth(tr);
+  const plusSm = wilderSmooth(plusDM);
+  const minusSm = wilderSmooth(minusDM);
+
+  const diPlusSeries = plusSm.map((v, i) => (atrSm[i] ? (100 * v) / atrSm[i] : 0));
+  const diMinusSeries = minusSm.map((v, i) => (atrSm[i] ? (100 * v) / atrSm[i] : 0));
+  const dxSeries = diPlusSeries.map((v, i) => {
+    const sum = v + diMinusSeries[i];
+    return sum ? (100 * Math.abs(v - diMinusSeries[i])) / sum : 0;
+  });
+  const adxSeries = wilderSmooth(dxSeries);
+
+  return {
+    adx: adxSeries.at(-1) ?? null,
+    diPlus: diPlusSeries.at(-1) ?? null,
+    diMinus: diMinusSeries.at(-1) ?? null,
+  };
+}
+
+/**
+ * Market breadth: lấy xu hướng VNINDEX để điều chỉnh điểm toàn watchlist.
+ * Một mã "tăng" có thể chỉ vì cả thị trường đang tăng — điều chỉnh này giúp
+ * tách bạch phần nào là sức mạnh nội tại của mã, phần nào là hiệu ứng thị trường
+ * chung. Nếu lấy dữ liệu VNINDEX thất bại, trả về null và bỏ qua bước điều
+ * chỉnh (không chặn toàn bộ kết quả vì 1 phần phụ này lỗi).
+ */
+async function fetchMarketBreadth(): Promise<MarketBreadth | null> {
+  try {
+    const { stock } = await getVnstock();
+    const start = new Date();
+    start.setDate(start.getDate() - 20);
+
+    let vni = await stock.quote({
+      ticker: "VNINDEX",
+      start: start.toISOString().slice(0, 10),
+    });
+    vni = trimUnclosedBar(vni);
+    if (!vni || vni.length < 2) return null;
+
+    const last = vni.at(-1)!.close;
+    const prev = vni.at(-2)!.close;
+    const chg1d = pctChange(prev, last);
+
+    let adjustment = 0;
+    if (chg1d < -1.5) adjustment = -8;
+    else if (chg1d < -0.5) adjustment = -4;
+    else if (chg1d > 1.5) adjustment = 5;
+    else if (chg1d > 0.5) adjustment = 3;
+
+    const trend: MarketBreadth["trend"] =
+      chg1d > 0.5 ? "bull" : chg1d < -0.5 ? "bear" : "neutral";
+
+    return { trend, chg1d, adjustment };
+  } catch (err) {
+    console.error("fetchMarketBreadth failed:", err);
+    return null;
+  }
+}
+
 /**
  * Chấm điểm momentum ngắn hạn cho 1 mã, tổng hợp nhiều chiều:
- * xu hướng (SMA20/50 + SuperTrend), động lượng (RSI/MACD), biến động
- * (Bollinger %B, ATR), và xác nhận dòng tiền (khối lượng).
+ * xu hướng (SMA20/50 + SuperTrend + ADX), động lượng (RSI/MACD), biến động
+ * (Bollinger %B, ATR), và xác nhận dòng tiền (khối lượng). Kèm stop-loss/mục
+ * tiêu giá dựa trên ATR + vùng hỗ trợ/kháng cự 20 phiên.
  *
  * Đây KHÔNG phải khuyến nghị đầu tư — chỉ tổng hợp chỉ báo kỹ thuật lịch sử.
  */
@@ -76,13 +199,7 @@ async function scoreShortTerm(ticker: string): Promise<ShortTermResult | null> {
     // thời cập nhật liên tục) — dùng nó để tính RSI/MACD/SMA/Bollinger sẽ khiến
     // điểm số nhảy loạn suốt phiên. Bỏ nến này đi, chỉ tính trên các phiên đã
     // đóng cửa thực sự; điểm số sẽ chỉ đổi 1 lần/ngày, sau khi thị trường đóng cửa.
-    if (isVnMarketHoursNow()) {
-      const today = vnTodayDateString();
-      const last = history.at(-1);
-      if (last && String(last.date).slice(0, 10) === today) {
-        history = history.slice(0, -1);
-      }
-    }
+    history = trimUnclosedBar(history);
 
     if (!history || history.length < 55) return null;
 
@@ -93,6 +210,7 @@ async function scoreShortTerm(ticker: string): Promise<ShortTermResult | null> {
     const bbSeries = bollinger(history, { period: 20, stddev: 2 });
     const atrSeries = atr(history, 14);
     const stSeries = superTrend(history);
+    const { adx, diPlus, diMinus } = computeADX(history, 14);
 
     const lastRsi = rsiSeries?.at(-1)?.rsi ?? null;
 
@@ -118,6 +236,9 @@ async function scoreShortTerm(ticker: string): Promise<ShortTermResult | null> {
     const lastAtr = atrSeries?.at(-1)?.atr ?? null;
     const atrPercent = lastAtr && closeNow ? (lastAtr / closeNow) * 100 : null;
 
+    const adxBullish =
+      diPlus !== null && diMinus !== null ? diPlus > diMinus : null;
+
     const recent20 = history.slice(-20);
     const avgVol20 =
       recent20.reduce((sum, r) => sum + r.volume, 0) / recent20.length;
@@ -127,12 +248,25 @@ async function scoreShortTerm(ticker: string): Promise<ShortTermResult | null> {
     const close5dAgo = history.at(-6)?.close ?? closeNow;
     const priceChange5d = pctChange(close5dAgo, closeNow);
 
+    // Hỗ trợ/kháng cự 20 phiên — dùng làm cơ sở đặt stop-loss & mục tiêu giá
+    const support20 = Math.min(...recent20.map((r) => r.low));
+    const resistance20 = Math.max(...recent20.map((r) => r.high));
+    const stopLoss = support20 > 0 ? support20 * 0.99 : null;
+    const target1 =
+      lastAtr !== null
+        ? Math.max(resistance20, closeNow + 2 * lastAtr)
+        : resistance20 || null;
+    const riskReward =
+      stopLoss !== null && target1 !== null && closeNow - stopLoss > 0
+        ? (target1 - closeNow) / (closeNow - stopLoss)
+        : null;
+
     // --- Chấm điểm 0-100, cộng dồn theo từng dải giá trị cụ thể ---
     let score = 50;
     const reasons: string[] = [];
 
-    // 1) Cấu trúc xu hướng: SMA20/50 + SuperTrend (trọng số lớn nhất — xu
-    //    hướng đúng chiều là điều kiện tiên quyết cho lướt sóng an toàn)
+    // 1) Cấu trúc xu hướng: SMA20/50 + SuperTrend + ADX (trọng số lớn nhất —
+    //    xu hướng đúng chiều VÀ đủ mạnh là điều kiện tiên quyết cho lướt sóng an toàn)
     if (trendAligned === true) {
       score += 15;
       reasons.push("Giá > SMA20 > SMA50 (xu hướng tăng rõ ràng)");
@@ -146,6 +280,18 @@ async function scoreShortTerm(ticker: string): Promise<ShortTermResult | null> {
     } else if (superTrendDirection === "bearish") {
       score -= 10;
       reasons.push("SuperTrend đang ở chiều giảm");
+    }
+    if (adx !== null && adxBullish !== null) {
+      if (adx > 25 && adxBullish) {
+        score += 10;
+        reasons.push(`ADX ${adx.toFixed(0)} xác nhận xu hướng tăng mạnh, không phải nhiễu`);
+      } else if (adx > 25 && !adxBullish) {
+        score -= 10;
+        reasons.push(`ADX ${adx.toFixed(0)} cho thấy phe bán đang mạnh`);
+      } else if (adx < 20) {
+        score -= 3;
+        reasons.push(`ADX ${adx.toFixed(0)} thấp — thị trường đang đi ngang, tín hiệu kém tin cậy`);
+      }
     }
 
     // 2) RSI — vùng động lượng khỏe mà chưa quá mua
@@ -246,8 +392,13 @@ async function scoreShortTerm(ticker: string): Promise<ShortTermResult | null> {
       superTrend: superTrendDirection,
       bollingerPercentB,
       atrPercent,
+      adx,
+      adxBullish,
       volumeRatio,
       priceChange5d,
+      stopLoss,
+      target1,
+      riskReward,
       reason: reasons.join("; ") || "Không đủ dữ liệu để đánh giá",
     };
   } catch (err) {
@@ -261,15 +412,27 @@ export async function runAnalysis(universe: string[] = DEFAULT_UNIVERSE) {
   // os.homedir() không ghi được trên Vercel serverless — chỉ /tmp là ghi được.
   await init({ cacheDir: path.join(os.tmpdir(), "vnstock-js-cache") });
 
-  const shortTermSettled = await Promise.all(
-    universe.map((t) => scoreShortTerm(t))
+  const [shortTermSettled, marketBreadth] = await Promise.all([
+    Promise.all(universe.map((t) => scoreShortTerm(t))),
+    fetchMarketBreadth(),
+  ]);
+
+  let shortTermRanked = shortTermSettled.filter(
+    (r): r is ShortTermResult => r !== null
   );
-  const shortTermRanked = shortTermSettled
-    .filter((r): r is ShortTermResult => r !== null)
-    .sort((a, b) => b.score - a.score);
+
+  // Áp điều chỉnh market breadth cho toàn bộ watchlist rồi xếp hạng lại
+  if (marketBreadth && marketBreadth.adjustment !== 0) {
+    shortTermRanked = shortTermRanked.map((r) => ({
+      ...r,
+      score: Math.round(Math.max(0, Math.min(100, r.score + marketBreadth.adjustment))),
+    }));
+  }
+  shortTermRanked = shortTermRanked.sort((a, b) => b.score - a.score);
 
   return {
     generatedAt: new Date().toISOString(),
+    marketBreadth,
     shortTerm: {
       best: shortTermRanked[0] ?? null,
       ranked: shortTermRanked.slice(0, 15),
