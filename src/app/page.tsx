@@ -74,7 +74,7 @@ export default function Home() {
       <header className="border-b border-[#1F252E] px-6 py-5 flex items-center justify-between">
         <div>
           <h1 className="font-[var(--font-display)] text-xl font-bold tracking-tight">
-            Song Kiếm
+            LUCID
           </h1>
           <p className="text-sm text-[#7C8797] mt-0.5">
             Mã tốt nhất để lướt sóng — xu hướng, động lượng, biến động, khối lượng.
@@ -168,7 +168,7 @@ export default function Home() {
             <table className="w-full text-sm font-[var(--font-mono)]">
               <thead>
                 <tr className="text-[#5A6270] text-xs">
-                  {["Mã", "Điểm", "RSI", "MACD", "Xu hướng", "%B", "ATR%", "KL/TB20", "Δ 5 phiên"].map((h) => (
+                  {["Mã", "Giá", "Điểm", "RSI", "MACD", "Xu hướng", "%B", "ATR%", "KL/TB20", "Δ 5 phiên"].map((h) => (
                     <th key={h} className="text-left font-normal px-3 py-2 border-b border-[#1F252E]">
                       {h}
                     </th>
@@ -179,6 +179,9 @@ export default function Home() {
                 {ranked.map((row, i) => (
                   <tr key={row.ticker + i} className="border-b border-[#161B22] last:border-0">
                     <td className="px-3 py-2 text-[#E7EAEE] font-semibold">{row.ticker}</td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">
+                      {row.lastClose ? `${fmt(row.lastClose)}k` : "—"}
+                    </td>
                     <td className="px-3 py-2 text-[#C4CBD4]">{row.score}</td>
                     <td className="px-3 py-2 text-[#C4CBD4]">{fmt(row.rsi14)}</td>
                     <td className="px-3 py-2 text-[#C4CBD4]">
