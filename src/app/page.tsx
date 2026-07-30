@@ -2,6 +2,12 @@
 
 import { useEffect, useState } from "react";
 
+interface MarketBreadth {
+  trend: "bull" | "bear" | "neutral";
+  chg1d: number;
+  adjustment: number;
+}
+
 interface ShortTermResult {
   ticker: string;
   score: number;
@@ -16,13 +22,19 @@ interface ShortTermResult {
   superTrend: "bullish" | "bearish" | null;
   bollingerPercentB: number | null;
   atrPercent: number | null;
+  adx: number | null;
+  adxBullish: boolean | null;
   volumeRatio: number | null;
   priceChange5d: number | null;
+  stopLoss: number | null;
+  target1: number | null;
+  riskReward: number | null;
   reason: string;
 }
 
 interface AnalysisResponse {
   generatedAt: string;
+  marketBreadth: MarketBreadth | null;
   shortTerm: { best: ShortTermResult | null; ranked: ShortTermResult[] };
 }
 
@@ -33,6 +45,7 @@ function fmt(n: number | null | undefined, digits = 1): string {
 
 const ACCENT = "#16C784";
 const DOWN = "#EA3943";
+const NEUTRAL = "#F0B90B";
 
 export default function Home() {
   const [data, setData] = useState<AnalysisResponse | null>(null);
@@ -68,13 +81,14 @@ export default function Home() {
 
   const best = data?.shortTerm.best ?? null;
   const ranked = data?.shortTerm.ranked ?? [];
+  const breadth = data?.marketBreadth ?? null;
 
   return (
     <main className="flex-1 flex flex-col">
       <header className="border-b border-[#1F252E] px-6 py-5 flex items-center justify-between">
         <div>
           <h1 className="font-[var(--font-display)] text-xl font-bold tracking-tight">
-            LUCID
+            Song Kiếm
           </h1>
           <p className="text-sm text-[#7C8797] mt-0.5">
             Mã tốt nhất để lướt sóng — xu hướng, động lượng, biến động, khối lượng.
@@ -95,8 +109,31 @@ export default function Home() {
         </div>
       )}
 
+      {breadth && (
+        <div
+          className="mx-6 mt-4 rounded-md border px-4 py-2 text-xs flex items-center gap-2"
+          style={{
+            borderColor: `${breadth.trend === "bull" ? ACCENT : breadth.trend === "bear" ? DOWN : "#262C36"}40`,
+            background: `${breadth.trend === "bull" ? ACCENT : breadth.trend === "bear" ? DOWN : "#262C36"}0D`,
+            color: breadth.trend === "bull" ? ACCENT : breadth.trend === "bear" ? DOWN : "#9AA4B2",
+          }}
+        >
+          <span className="font-[var(--font-mono)] font-semibold">
+            VNINDEX {breadth.chg1d >= 0 ? "+" : ""}
+            {fmt(breadth.chg1d)}%
+          </span>
+          <span className="text-[#7C8797]">
+            {breadth.trend === "bull"
+              ? `Thị trường tích cực — đã cộng ${breadth.adjustment} điểm cho toàn bộ watchlist`
+              : breadth.trend === "bear"
+              ? `Thị trường tiêu cực — đã trừ ${Math.abs(breadth.adjustment)} điểm cho toàn bộ watchlist`
+              : "Thị trường trung tính — không điều chỉnh điểm"}
+          </span>
+        </div>
+      )}
+
       <section className="p-6 flex flex-col gap-6 max-w-5xl w-full mx-auto">
-        <div className="flex items-baseline gap-2">
+        <div className="flex items-baseline gap-2 flex-wrap">
           <span
             className="text-xs font-semibold tracking-[0.15em] font-[var(--font-mono)]"
             style={{ color: ACCENT }}
@@ -104,7 +141,7 @@ export default function Home() {
             LƯỚT SÓNG
           </span>
           <span className="text-xs text-[#5A6270]">
-            Xu hướng (SMA/SuperTrend) · Động lượng (RSI/MACD) · Biến động (Bollinger/ATR) · Khối lượng
+            Xu hướng (SMA/SuperTrend/ADX) · Động lượng (RSI/MACD) · Biến động (Bollinger/ATR) · Khối lượng · VNINDEX
           </span>
         </div>
 
@@ -149,7 +186,11 @@ export default function Home() {
                 value={best.superTrend === "bullish" ? "Tăng" : best.superTrend === "bearish" ? "Giảm" : "—"}
                 color={best.superTrend === "bullish" ? ACCENT : best.superTrend === "bearish" ? DOWN : undefined}
               />
-              <Stat label="Giá vs SMA20" value={best.priceVsSma20Pct !== null ? `${fmt(best.priceVsSma20Pct)}%` : "—"} />
+              <Stat
+                label="ADX (độ mạnh xu hướng)"
+                value={best.adx !== null ? `${fmt(best.adx, 0)}${best.adxBullish ? " ↑" : best.adxBullish === false ? " ↓" : ""}` : "—"}
+                color={best.adx !== null && best.adx > 25 ? (best.adxBullish ? ACCENT : DOWN) : undefined}
+              />
               <Stat label="RSI (14)" value={fmt(best.rsi14)} />
               <Stat
                 label="MACD hist."
@@ -159,6 +200,21 @@ export default function Home() {
               <Stat label="ATR / giá" value={best.atrPercent !== null ? `${fmt(best.atrPercent)}%` : "—"} />
               <Stat label="KL / TB20" value={best.volumeRatio ? `${fmt(best.volumeRatio, 2)}x` : "—"} />
               <Stat label="Δ giá 5 phiên" value={`${fmt(best.priceChange5d)}%`} />
+              <Stat
+                label="Stop-loss (tham khảo)"
+                value={best.stopLoss ? `${fmt(best.stopLoss)}k` : "—"}
+                color={DOWN}
+              />
+              <Stat
+                label="Mục tiêu giá (tham khảo)"
+                value={best.target1 ? `${fmt(best.target1)}k` : "—"}
+                color={ACCENT}
+              />
+              <Stat
+                label="Tỷ lệ Risk:Reward"
+                value={best.riskReward !== null ? `1:${fmt(best.riskReward, 1)}` : "—"}
+                color={best.riskReward !== null && best.riskReward >= 2 ? ACCENT : NEUTRAL}
+              />
             </div>
           </div>
         )}
@@ -168,7 +224,7 @@ export default function Home() {
             <table className="w-full text-sm font-[var(--font-mono)]">
               <thead>
                 <tr className="text-[#5A6270] text-xs">
-                  {["Mã", "Giá", "Điểm", "RSI", "MACD", "Xu hướng", "%B", "ATR%", "KL/TB20", "Δ 5 phiên"].map((h) => (
+                  {["Mã", "Giá", "Điểm", "RSI", "MACD", "Xu hướng", "ADX", "%B", "ATR%", "KL/TB20", "Δ 5 phiên", "R:R"].map((h) => (
                     <th key={h} className="text-left font-normal px-3 py-2 border-b border-[#1F252E]">
                       {h}
                     </th>
@@ -201,6 +257,10 @@ export default function Home() {
                     >
                       {row.trendAligned === null ? "—" : row.trendAligned ? "Thuận" : "Chưa thuận"}
                     </td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">
+                      {row.adx !== null ? fmt(row.adx, 0) : "—"}
+                      {row.adxBullish ? " ↑" : row.adxBullish === false ? " ↓" : ""}
+                    </td>
                     <td className="px-3 py-2 text-[#C4CBD4]">{fmt(row.bollingerPercentB, 2)}</td>
                     <td className="px-3 py-2 text-[#C4CBD4]">
                       {row.atrPercent !== null ? `${fmt(row.atrPercent)}%` : "—"}
@@ -209,6 +269,9 @@ export default function Home() {
                       {row.volumeRatio ? `${fmt(row.volumeRatio, 2)}x` : "—"}
                     </td>
                     <td className="px-3 py-2 text-[#C4CBD4]">{fmt(row.priceChange5d)}%</td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">
+                      {row.riskReward !== null ? `1:${fmt(row.riskReward, 1)}` : "—"}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -221,7 +284,9 @@ export default function Home() {
         <span>
           {data ? `Cập nhật lúc ${new Date(data.generatedAt).toLocaleTimeString("vi-VN")}` : ""}
         </span>
-        <span>Chỉ mang tính tham khảo kỹ thuật — không phải khuyến nghị đầu tư.</span>
+        <span>
+          Tính trên các phiên đã đóng cửa — không phải khuyến nghị đầu tư, kể cả stop-loss/mục tiêu giá.
+        </span>
       </footer>
     </main>
   );
