@@ -159,17 +159,32 @@ export async function runWeightRegression(
     return pctChange(vni[idx - 5].close, vni[idx].close);
   }
 
-  const histories = await Promise.all(
-    tickers.map(async (ticker) => {
-      try {
-        let h = await fns.stock.quote({ ticker, start: startStr });
-        h = trimUnclosedBar(h);
-        return { ticker, history: h };
-      } catch (err) {
-        console.error(`runWeightRegression: lỗi khi lấy dữ liệu ${ticker}`, err);
-        return { ticker, history: null };
-      }
-    })
+  // Lấy dữ liệu 500 ngày cho 20 mã CÙNG LÚC (như /api/analyze làm với 150 ngày)
+  // dễ khiến nguồn dữ liệu TCBS/Vietcap chậm/timeout một phần do payload lớn hơn
+  // nhiều — chia thành từng đợt nhỏ (5 mã/đợt) để ổn định hơn, đổi lấy chút thời
+  // gian chờ thêm (vẫn nằm trong 60s của serverless function).
+  const BATCH_SIZE = 5;
+  const histories: { ticker: string; history: any }[] = [];
+  for (let i = 0; i < tickers.length; i += BATCH_SIZE) {
+    const batch = tickers.slice(i, i + BATCH_SIZE);
+    const batchResults = await Promise.all(
+      batch.map(async (ticker) => {
+        try {
+          let h = await fns.stock.quote({ ticker, start: startStr });
+          h = trimUnclosedBar(h);
+          return { ticker, history: h };
+        } catch (err) {
+          console.error(`runWeightRegression: lỗi khi lấy dữ liệu ${ticker}`, err);
+          return { ticker, history: null };
+        }
+      })
+    );
+    histories.push(...batchResults);
+  }
+
+  const validCount = histories.filter((h) => h.history && h.history.length >= 120).length;
+  console.log(
+    `[runWeightRegression] ${validCount}/${tickers.length} mã lấy dữ liệu thành công (đủ >=120 phiên)`
   );
 
   const X: number[][] = [];
@@ -189,6 +204,8 @@ export async function runWeightRegression(
       y.push(forwardReturnPct);
     }
   }
+
+  console.log(`[runWeightRegression] thu được ${X.length} mẫu (cần >= ${FEATURES.length * 10})`);
 
   if (X.length < FEATURES.length * 10) return null; // không đủ mẫu để hồi quy đáng tin cậy
 
