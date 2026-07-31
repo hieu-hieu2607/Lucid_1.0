@@ -63,11 +63,6 @@ const FEATURES: { name: string; label: string; extract: (r: ShortTermResult) => 
   { name: "bollinger", label: "Bollinger %B", extract: (r) => r.bollingerPercentB ?? 0.5 },
   { name: "volumeRatio", label: "Khối lượng / TB 20 phiên", extract: (r) => r.volumeRatio ?? 1 },
   {
-    name: "foreignNetRatio",
-    label: "Khối ngoại mua/bán ròng (% tổng KL)",
-    extract: (r) => r.foreignNetRatio ?? 0,
-  },
-  {
     name: "relativeStrength5d",
     label: "Sức mạnh tương đối vs VNINDEX 5 phiên (%)",
     extract: (r) => r.relativeStrength5d ?? 0,
@@ -210,7 +205,12 @@ export async function runWeightRegression(
   if (X.length < FEATURES.length * 10) return null; // không đủ mẫu để hồi quy đáng tin cậy
 
   const fit = ols(X, y);
-  if (!fit) return null;
+  if (!fit) {
+    console.error(
+      "[runWeightRegression] ols() thất bại — ma trận suy biến (có biến bị hằng số/đa cộng tuyến hoàn toàn)"
+    );
+    return null;
+  }
 
   return {
     tickers,
