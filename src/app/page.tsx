@@ -507,6 +507,15 @@ interface RegressionCoefficient {
   name: string;
   label: string;
   coef: number;
+  standardError: number | null;
+  pValue: number | null;
+  significant: boolean;
+}
+
+interface PredictedPick {
+  ticker: string;
+  lastClose: number | null;
+  predictedReturnPct: number;
 }
 
 interface RegressionResult {
@@ -515,6 +524,7 @@ interface RegressionResult {
   sampleCount: number;
   r2: number;
   coefficients: RegressionCoefficient[];
+  predictions: PredictedPick[];
 }
 
 function RegressionPanel() {
@@ -604,7 +614,7 @@ function RegressionPanel() {
             <table className="w-full text-sm font-[var(--font-mono)]">
               <thead>
                 <tr className="text-[#5A6270] text-xs">
-                  {["Biến số", "Hệ số", "Đọc hiểu"].map((h) => (
+                  {["Biến số", "Hệ số", "p-value", "Đọc hiểu"].map((h) => (
                     <th key={h} className="text-left font-normal px-3 py-2 border-b border-[#1F252E]">
                       {h}
                     </th>
@@ -619,12 +629,15 @@ function RegressionPanel() {
                       {c.coef >= 0 ? "+" : ""}
                       {c.coef.toFixed(3)}
                     </td>
+                    <td className="px-3 py-2" style={{ color: c.significant ? "#E7EAEE" : "#5A6270" }}>
+                      {c.pValue !== null ? c.pValue.toFixed(3) : "—"}
+                    </td>
                     <td className="px-3 py-2 text-[#7C8797]">
-                      {Math.abs(c.coef) < 0.01
-                        ? "gần như không có ảnh hưởng"
+                      {!c.significant
+                        ? "chưa đủ ý nghĩa thống kê (p ≥ 0.05) — có thể chỉ là nhiễu"
                         : c.coef > 0
-                        ? "hướng chấm điểm hiện tại (cộng điểm) có cơ sở"
-                        : "NGƯỢC hướng đang chấm điểm — nên xem lại dấu +/- hiện tại"}
+                        ? "có ý nghĩa thống kê — hướng chấm điểm hiện tại (cộng điểm) có cơ sở"
+                        : "có ý nghĩa thống kê nhưng NGƯỢC hướng đang chấm điểm — nên xem lại dấu +/- hiện tại"}
                     </td>
                   </tr>
                 ))}
@@ -633,8 +646,52 @@ function RegressionPanel() {
           </div>
           <p className="text-xs text-[#5A6270]">
             Fit trên ~{result.sampleCount} mẫu gộp từ {result.tickers.length} mã — đủ để chẩn đoán xu hướng chung,
-            nhưng không đủ để khẳng định chắc chắn cho từng mã riêng lẻ. Không phải khuyến nghị đầu tư.
+            nhưng không đủ để khẳng định chắc chắn cho từng mã riêng lẻ. p-value ước tính theo phân phối chuẩn
+            (số mẫu đủ lớn nên xấp xỉ này đáng tin). Không phải khuyến nghị đầu tư.
           </p>
+
+          {result.predictions.length > 0 && (
+            <div className="flex flex-col gap-2 mt-2">
+              <div className="text-xs font-semibold tracking-[0.15em] font-[var(--font-mono)] text-[#B7C0CC]">
+                DỰ ĐOÁN THEO MÔ HÌNH (THỬ NGHIỆM)
+              </div>
+              <p className="text-xs text-[#5A6270] max-w-2xl">
+                Áp hệ số vừa fit vào dữ liệu mới nhất của từng mã để ước tính return kỳ vọng {result.forwardDays} phiên tới.
+                Đây là mô hình fit TRONG-MẪU (in-sample) — chưa kiểm chứng trên dữ liệu ngoài mẫu, và R² ở trên cho thấy
+                độ tin cậy tổng thể vẫn thấp. Xem như một cách xếp hạng khác để tham khảo, không phải dự báo chắc chắn.
+              </p>
+              <div className="overflow-x-auto rounded-lg border border-[#1F252E]">
+                <table className="w-full text-sm font-[var(--font-mono)]">
+                  <thead>
+                    <tr className="text-[#5A6270] text-xs">
+                      {["Mã", "Giá", "Return kỳ vọng"].map((h) => (
+                        <th key={h} className="text-left font-normal px-3 py-2 border-b border-[#1F252E]">
+                          {h}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {result.predictions.slice(0, 10).map((p) => (
+                      <tr key={p.ticker} className="border-b border-[#161B22] last:border-0">
+                        <td className="px-3 py-2 text-[#E7EAEE] font-semibold">{p.ticker}</td>
+                        <td className="px-3 py-2 text-[#C4CBD4]">
+                          {p.lastClose ? `${fmt(p.lastClose)}k` : "—"}
+                        </td>
+                        <td
+                          className="px-3 py-2"
+                          style={{ color: p.predictedReturnPct >= 0 ? ACCENT : DOWN }}
+                        >
+                          {p.predictedReturnPct >= 0 ? "+" : ""}
+                          {fmt(p.predictedReturnPct)}%
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
