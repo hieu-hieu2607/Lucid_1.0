@@ -108,7 +108,11 @@ export default function Home() {
             Song Kiếm
           </h1>
           <p className="text-sm text-[#7C8797] mt-0.5">
-            Mã tốt nhất để lướt sóng — xu hướng, động lượng, biến động, khối lượng, khối ngoại.
+            Bảng chỉ báo kỹ thuật tổng hợp cho lướt sóng — xu hướng, động lượng, biến động, khối lượng, khối ngoại.
+          </p>
+          <p className="text-xs text-[#5A6270] mt-1 max-w-2xl">
+            Đây là công cụ tổng hợp chỉ báo để bạn tự đánh giá, KHÔNG phải xếp hạng đã kiểm chứng có khả năng dự đoán —
+            xem mục Backtest/Hồi quy bên dưới để biết mức độ tin cậy thực tế của điểm số.
           </p>
         </div>
         <button
@@ -187,7 +191,7 @@ export default function Home() {
                 >
                   {best.score}
                 </div>
-                <div className="text-xs text-[#5A6270]">điểm / 100</div>
+                <div className="text-xs text-[#5A6270]">điểm tổng hợp / 100 (tham khảo)</div>
               </div>
             </div>
 
@@ -324,6 +328,7 @@ export default function Home() {
         )}
 
         <BacktestPanel />
+        <RegressionPanel />
       </section>
 
       <footer className="border-t border-[#1F252E] px-6 py-3 text-xs text-[#5A6270] flex items-center justify-between">
@@ -331,7 +336,7 @@ export default function Home() {
           {data ? `Cập nhật lúc ${new Date(data.generatedAt).toLocaleTimeString("vi-VN")}` : ""}
         </span>
         <span>
-          Tính trên các phiên đã đóng cửa — không phải khuyến nghị đầu tư, kể cả stop-loss/mục tiêu giá.
+          Tính trên các phiên đã đóng cửa — công cụ tham khảo, chưa qua kiểm chứng thống kê chắc chắn (xem Backtest/Hồi quy). Không phải khuyến nghị đầu tư.
         </span>
       </footer>
     </main>
@@ -366,6 +371,7 @@ interface BacktestResult {
 
 function BacktestPanel() {
   const [ticker, setTicker] = useState("VNM");
+  const [forwardDays, setForwardDays] = useState(5);
   const [result, setResult] = useState<BacktestResult | null>(null);
   const [btError, setBtError] = useState<string | null>(null);
   const [btLoading, setBtLoading] = useState(false);
@@ -376,7 +382,9 @@ function BacktestPanel() {
     setBtError(null);
     setResult(null);
     try {
-      const res = await fetch(`/api/backtest?ticker=${encodeURIComponent(ticker.trim())}`);
+      const res = await fetch(
+        `/api/backtest?ticker=${encodeURIComponent(ticker.trim())}&forwardDays=${forwardDays}`
+      );
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? "Lỗi backtest");
       setResult(json);
@@ -391,21 +399,37 @@ function BacktestPanel() {
     <div className="rounded-xl border border-[#1F252E] p-5 flex flex-col gap-4">
       <div>
         <div className="text-xs font-semibold tracking-[0.15em] font-[var(--font-mono)] text-[#B7C0CC]">
-          BACKTEST
+          BACKTEST (1 MÃ)
         </div>
         <p className="text-xs text-[#5A6270] mt-1 max-w-2xl">
-          Kiểm chứng: điểm số ở quá khứ có thực sự đi kèm giá tăng tốt hơn 5 phiên sau đó không?
-          Chỉ chạy 1 mã/lần, dùng đúng công thức chấm điểm đang chạy live, không nhìn thấy dữ liệu tương lai.
+          Kiểm chứng: điểm số ở quá khứ có thực sự đi kèm giá tăng tốt hơn N phiên sau đó không?
+          Dùng đúng công thức chấm điểm đang chạy live, không nhìn thấy dữ liệu tương lai.
         </p>
       </div>
 
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
         <input
           value={ticker}
           onChange={(e) => setTicker(e.target.value.toUpperCase())}
           placeholder="VD: VNM"
           className="bg-black/30 border border-[#262C36] rounded-md px-3 py-1.5 text-sm font-[var(--font-mono)] w-28 focus:outline-none focus:border-[#3A4250]"
         />
+        <div className="flex items-center gap-1 text-xs text-[#7C8797]">
+          <span>Dự báo</span>
+          {[5, 10, 20].map((d) => (
+            <button
+              key={d}
+              onClick={() => setForwardDays(d)}
+              className="px-2 py-1 rounded border font-[var(--font-mono)] transition-colors"
+              style={{
+                borderColor: forwardDays === d ? ACCENT : "#262C36",
+                color: forwardDays === d ? ACCENT : "#7C8797",
+              }}
+            >
+              {d}p
+            </button>
+          ))}
+        </div>
         <button
           onClick={runBacktest}
           disabled={btLoading}
@@ -472,6 +496,144 @@ function BacktestPanel() {
           </div>
           <p className="text-xs text-[#5A6270]">
             Backtest dựa trên dữ liệu lịch sử của riêng mã này — không đảm bảo lặp lại trong tương lai, và không phải khuyến nghị đầu tư.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface RegressionCoefficient {
+  name: string;
+  label: string;
+  coef: number;
+}
+
+interface RegressionResult {
+  tickers: string[];
+  forwardDays: number;
+  sampleCount: number;
+  r2: number;
+  coefficients: RegressionCoefficient[];
+}
+
+function RegressionPanel() {
+  const [forwardDays, setForwardDays] = useState(5);
+  const [result, setResult] = useState<RegressionResult | null>(null);
+  const [rgError, setRgError] = useState<string | null>(null);
+  const [rgLoading, setRgLoading] = useState(false);
+
+  async function runRegression() {
+    setRgLoading(true);
+    setRgError(null);
+    setResult(null);
+    try {
+      const res = await fetch(`/api/regression?forwardDays=${forwardDays}`);
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? "Lỗi hồi quy");
+      setResult(json);
+    } catch (e: any) {
+      setRgError(e.message ?? "Có lỗi xảy ra");
+    } finally {
+      setRgLoading(false);
+    }
+  }
+
+  const nonIntercept = result?.coefficients.filter((c) => c.name !== "intercept") ?? [];
+  const sorted = [...nonIntercept].sort((a, b) => Math.abs(b.coef) - Math.abs(a.coef));
+
+  return (
+    <div className="rounded-xl border border-[#1F252E] p-5 flex flex-col gap-4">
+      <div>
+        <div className="text-xs font-semibold tracking-[0.15em] font-[var(--font-mono)] text-[#B7C0CC]">
+          HỒI QUY TRỌNG SỐ (CẢ WATCHLIST)
+        </div>
+        <p className="text-xs text-[#5A6270] mt-1 max-w-2xl">
+          Gộp dữ liệu backtest của toàn bộ watchlist, fit hồi quy tuyến tính để xem hướng chấm điểm
+          nào (RSI, MACD, khối ngoại...) thực sự được dữ liệu ủng hộ. Hệ số dương = càng cao thì return
+          càng tốt; hệ số âm = ngược lại. Đây là công cụ CHẨN ĐOÁN — không tự động áp vào công thức đang chạy live.
+        </p>
+      </div>
+
+      <div className="flex items-center gap-2 flex-wrap">
+        <div className="flex items-center gap-1 text-xs text-[#7C8797]">
+          <span>Dự báo</span>
+          {[5, 10, 20].map((d) => (
+            <button
+              key={d}
+              onClick={() => setForwardDays(d)}
+              className="px-2 py-1 rounded border font-[var(--font-mono)] transition-colors"
+              style={{
+                borderColor: forwardDays === d ? NEUTRAL : "#262C36",
+                color: forwardDays === d ? NEUTRAL : "#7C8797",
+              }}
+            >
+              {d}p
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={runRegression}
+          disabled={rgLoading}
+          className="text-sm px-3 py-1.5 rounded-md border border-[#262C36] hover:border-[#3A4250] text-[#B7C0CC] disabled:opacity-50 transition-colors"
+        >
+          {rgLoading ? "Đang chạy (có thể mất 20-40s)…" : "Chạy hồi quy"}
+        </button>
+      </div>
+
+      {rgError && (
+        <div className="rounded-md border border-[#EA394340] bg-[#EA39430D] px-4 py-2 text-sm text-[#F2A5A9]">
+          {rgError}
+        </div>
+      )}
+
+      {result && (
+        <div className="flex flex-col gap-3">
+          <div className="text-sm text-[#9AA4B2]">
+            {result.tickers.length} mã · {result.sampleCount} mẫu gộp · dự báo {result.forwardDays} phiên tới ·{" "}
+            R²:{" "}
+            <span className="font-[var(--font-mono)] font-semibold text-[#E7EAEE]">
+              {(result.r2 * 100).toFixed(1)}%
+            </span>
+            <span className="text-[#5A6270]">
+              {" "}
+              (% biến động return giải thích được bởi toàn bộ các biến — càng thấp càng cho thấy phần lớn biến động giá là nhiễu/ngẫu nhiên, không nằm trong các chỉ báo này)
+            </span>
+          </div>
+          <div className="overflow-x-auto rounded-lg border border-[#1F252E]">
+            <table className="w-full text-sm font-[var(--font-mono)]">
+              <thead>
+                <tr className="text-[#5A6270] text-xs">
+                  {["Biến số", "Hệ số", "Đọc hiểu"].map((h) => (
+                    <th key={h} className="text-left font-normal px-3 py-2 border-b border-[#1F252E]">
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.map((c) => (
+                  <tr key={c.name} className="border-b border-[#161B22] last:border-0">
+                    <td className="px-3 py-2 text-[#E7EAEE]">{c.label}</td>
+                    <td className="px-3 py-2" style={{ color: c.coef >= 0 ? ACCENT : DOWN }}>
+                      {c.coef >= 0 ? "+" : ""}
+                      {c.coef.toFixed(3)}
+                    </td>
+                    <td className="px-3 py-2 text-[#7C8797]">
+                      {Math.abs(c.coef) < 0.01
+                        ? "gần như không có ảnh hưởng"
+                        : c.coef > 0
+                        ? "hướng chấm điểm hiện tại (cộng điểm) có cơ sở"
+                        : "NGƯỢC hướng đang chấm điểm — nên xem lại dấu +/- hiện tại"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-xs text-[#5A6270]">
+            Fit trên ~{result.sampleCount} mẫu gộp từ {result.tickers.length} mã — đủ để chẩn đoán xu hướng chung,
+            nhưng không đủ để khẳng định chắc chắn cho từng mã riêng lẻ. Không phải khuyến nghị đầu tư.
           </p>
         </div>
       )}
