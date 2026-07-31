@@ -105,14 +105,10 @@ export default function Home() {
       <header className="border-b border-[#1F252E] px-6 py-5 flex items-center justify-between">
         <div>
           <h1 className="font-[var(--font-display)] text-xl font-bold tracking-tight">
-            Song Kiếm
+            LUCID
           </h1>
           <p className="text-sm text-[#7C8797] mt-0.5">
             Bảng chỉ báo kỹ thuật tổng hợp cho lướt sóng — xu hướng, động lượng, biến động, khối lượng, khối ngoại.
-          </p>
-          <p className="text-xs text-[#5A6270] mt-1 max-w-2xl">
-            Đây là công cụ tổng hợp chỉ báo để bạn tự đánh giá, KHÔNG phải xếp hạng đã kiểm chứng có khả năng dự đoán —
-            xem mục Backtest/Hồi quy bên dưới để biết mức độ tin cậy thực tế của điểm số.
           </p>
         </div>
         <button
