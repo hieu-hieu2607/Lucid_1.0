@@ -5,6 +5,15 @@ export interface RegressionCoefficient {
   name: string;
   label: string;
   coef: number;
+  standardError: number | null;
+  pValue: number | null;
+  significant: boolean; // p < 0.05
+}
+
+export interface PredictedPick {
+  ticker: string;
+  lastClose: number | null;
+  predictedReturnPct: number;
 }
 
 export interface RegressionResult {
@@ -13,6 +22,7 @@ export interface RegressionResult {
   sampleCount: number;
   r2: number;
   coefficients: RegressionCoefficient[];
+  predictions: PredictedPick[];
 }
 
 /**
@@ -71,10 +81,10 @@ const FEATURES: { name: string; label: string; extract: (r: ShortTermResult) => 
   { name: "atrPercent", label: "ATR (% giá)", extract: (r) => r.atrPercent ?? 0 },
 ];
 
-/** Giải hệ phương trình tuyến tính Ax = b bằng khử Gauss-Jordan (pivot từng phần). */
-function solveLinearSystem(A: number[][], b: number[]): number[] | null {
+/** Nghịch đảo ma trận vuông bằng khử Gauss-Jordan (augment với ma trận đơn vị). */
+function invertMatrix(A: number[][]): number[][] | null {
   const n = A.length;
-  const M = A.map((row, i) => [...row, b[i]]);
+  const M = A.map((row, i) => [...row, ...Array.from({ length: n }, (_, j) => (i === j ? 1 : 0))]);
 
   for (let col = 0; col < n; col++) {
     let pivotRow = col;
@@ -85,18 +95,45 @@ function solveLinearSystem(A: number[][], b: number[]): number[] | null {
     if (Math.abs(M[col][col]) < 1e-9) return null; // ma trận suy biến (đa cộng tuyến quá nặng)
 
     const pivot = M[col][col];
-    for (let c = col; c <= n; c++) M[col][c] /= pivot;
+    for (let c = 0; c < 2 * n; c++) M[col][c] /= pivot;
     for (let r = 0; r < n; r++) {
       if (r === col) continue;
       const factor = M[r][col];
-      for (let c = col; c <= n; c++) M[r][c] -= factor * M[col][c];
+      for (let c = 0; c < 2 * n; c++) M[r][c] -= factor * M[col][c];
     }
   }
-  return M.map((row) => row[n]);
+  return M.map((row) => row.slice(n));
 }
 
-/** Hồi quy tuyến tính bội (OLS) qua phương trình chuẩn (XᵀX)β = XᵀY. */
-function ols(X: number[][], y: number[]): { coefs: number[]; r2: number } | null {
+/** Xấp xỉ hàm erf (Abramowitz-Stegun) để tính phân phối chuẩn tắc. */
+function erf(z: number): number {
+  const t = 1 / (1 + 0.3275911 * Math.abs(z));
+  const y =
+    1 -
+    (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) *
+      t *
+      Math.exp(-z * z);
+  return z >= 0 ? y : -y;
+}
+
+function normalCdf(z: number): number {
+  return 0.5 * (1 + erf(z / Math.SQRT2));
+}
+
+/** p-value 2 phía từ thống kê t, xấp xỉ bằng phân phối chuẩn (chính xác khi bậc tự do lớn — luôn đúng ở đây vì n >> p). */
+function twoTailedPValue(tStat: number): number {
+  return 2 * (1 - normalCdf(Math.abs(tStat)));
+}
+
+/**
+ * Hồi quy tuyến tính bội (OLS) qua phương trình chuẩn (XᵀX)β = XᵀY, kèm sai số
+ * chuẩn và p-value cho từng hệ số — để biết hệ số nào thực sự có ý nghĩa
+ * thống kê (p<0.05) thay vì chỉ nhìn dấu +/- của ước lượng điểm.
+ */
+function ols(
+  X: number[][],
+  y: number[]
+): { coefs: number[]; standardErrors: (number | null)[]; pValues: (number | null)[]; r2: number } | null {
   const n = X.length;
   const p = X[0].length;
   const XtX: number[][] = Array.from({ length: p }, () => new Array(p).fill(0));
@@ -111,8 +148,10 @@ function ols(X: number[][], y: number[]): { coefs: number[]; r2: number } | null
     }
   }
 
-  const coefs = solveLinearSystem(XtX, XtY);
-  if (!coefs) return null;
+  const invXtX = invertMatrix(XtX);
+  if (!invXtX) return null;
+
+  const coefs = invXtX.map((row) => row.reduce((s, v, j) => s + v * XtY[j], 0));
 
   const yMean = y.reduce((a, b) => a + b, 0) / n;
   let ssTot = 0;
@@ -123,15 +162,29 @@ function ols(X: number[][], y: number[]): { coefs: number[]; r2: number } | null
     ssTot += (y[i] - yMean) ** 2;
   }
   const r2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
-  return { coefs, r2 };
+
+  const dof = n - p;
+  const sigma2 = dof > 0 ? ssRes / dof : null;
+  const standardErrors = coefs.map((_, j) =>
+    sigma2 !== null && invXtX[j][j] > 0 ? Math.sqrt(sigma2 * invXtX[j][j]) : null
+  );
+  const pValues = coefs.map((c, j) => {
+    const se = standardErrors[j];
+    if (se === null || se === 0) return null;
+    return twoTailedPValue(c / se);
+  });
+
+  return { coefs, standardErrors, pValues, r2 };
 }
 
 /**
- * Chạy backtest gộp qua nhiều mã, trích đặc trưng từ mỗi mốc thời gian, rồi
- * fit hồi quy tuyến tính để xem hướng chấm điểm nào thực sự được dữ liệu ủng hộ.
- * Lấy dữ liệu của tất cả mã SONG SONG (Promise.all) để không vượt giới hạn
- * thời gian của serverless function; phần tính toán chỉ báo là CPU-bound nên
- * nhanh, không cần gọi mạng thêm sau bước fetch ban đầu.
+ * Chạy backtest gộp qua nhiều mã, trích đặc trưng từ mỗi mốc thời gian, fit
+ * hồi quy tuyến tính để xem hướng chấm điểm nào thực sự được dữ liệu ủng hộ
+ * (kèm p-value), rồi áp mô hình đã fit vào dữ liệu MỚI NHẤT của từng mã để
+ * đưa ra "return kỳ vọng" — một cách chấm điểm khác, dựa trên số liệu thống
+ * kê thay vì trọng số tự chọn. Đây vẫn là mô hình fit trong-mẫu (in-sample),
+ * chưa kiểm chứng ngoài mẫu, nên coi là thử nghiệm, không phải kết luận chắc
+ * chắn.
  */
 export async function runWeightRegression(
   tickers: string[],
@@ -154,10 +207,8 @@ export async function runWeightRegression(
     return pctChange(vni[idx - 5].close, vni[idx].close);
   }
 
-  // Lấy dữ liệu 500 ngày cho 20 mã CÙNG LÚC (như /api/analyze làm với 150 ngày)
-  // dễ khiến nguồn dữ liệu TCBS/Vietcap chậm/timeout một phần do payload lớn hơn
-  // nhiều — chia thành từng đợt nhỏ (5 mã/đợt) để ổn định hơn, đổi lấy chút thời
-  // gian chờ thêm (vẫn nằm trong 60s của serverless function).
+  // Lấy dữ liệu 500 ngày cho 20 mã CÙNG LÚC dễ khiến nguồn dữ liệu chậm/timeout
+  // một phần do payload lớn — chia thành từng đợt nhỏ (5 mã/đợt) để ổn định hơn.
   const BATCH_SIZE = 5;
   const histories: { ticker: string; history: any }[] = [];
   for (let i = 0; i < tickers.length; i += BATCH_SIZE) {
@@ -212,11 +263,34 @@ export async function runWeightRegression(
     return null;
   }
 
+  // Áp hệ số vừa fit vào dữ liệu MỚI NHẤT (toàn bộ history, không cắt) của
+  // từng mã để ra "return kỳ vọng" hôm nay — đây là "phán đoán" dựa trên mô
+  // hình thống kê thay vì công thức chấm điểm cũ.
+  const predictions: PredictedPick[] = [];
+  for (const { ticker, history } of histories) {
+    if (!history || history.length < 120) continue;
+    const cutoff = history.length - 1;
+    const result = computeScoreFromHistory(ticker, history, vniChg5dAt(history, cutoff), null, fns);
+    if (!result) continue;
+    const features = FEATURES.map((f) => f.extract(result));
+    const predictedReturnPct = features.reduce((s, xi, i) => s + xi * fit.coefs[i], 0);
+    predictions.push({ ticker, lastClose: result.lastClose, predictedReturnPct });
+  }
+  predictions.sort((a, b) => b.predictedReturnPct - a.predictedReturnPct);
+
   return {
     tickers,
     forwardDays,
     sampleCount: X.length,
     r2: fit.r2,
-    coefficients: FEATURES.map((f, i) => ({ name: f.name, label: f.label, coef: fit.coefs[i] })),
+    coefficients: FEATURES.map((f, i) => ({
+      name: f.name,
+      label: f.label,
+      coef: fit.coefs[i],
+      standardError: fit.standardErrors[i],
+      pValue: fit.pValues[i],
+      significant: fit.pValues[i] !== null && (fit.pValues[i] as number) < 0.05,
+    })),
+    predictions,
   };
 }
