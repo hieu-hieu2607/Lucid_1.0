@@ -21,7 +21,7 @@ const monoFont = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Song Kiếm — Lướt sóng & Dài hạn",
+  title: "LUCID",
   description:
     "Phân tích cổ phiếu Việt Nam: chọn mã tốt nhất để lướt sóng và mã tốt nhất để đầu tư dài hạn.",
 };
