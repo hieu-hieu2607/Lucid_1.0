@@ -105,10 +105,14 @@ export default function Home() {
       <header className="border-b border-[#1F252E] px-6 py-5 flex items-center justify-between">
         <div>
           <h1 className="font-[var(--font-display)] text-xl font-bold tracking-tight">
-            LUCID
+            Lucid Dream
           </h1>
           <p className="text-sm text-[#7C8797] mt-0.5">
             Bảng chỉ báo kỹ thuật tổng hợp cho lướt sóng — xu hướng, động lượng, biến động, khối lượng, khối ngoại.
+          </p>
+          <p className="text-xs text-[#5A6270] mt-1 max-w-2xl">
+            Đây là công cụ tổng hợp chỉ báo để bạn tự đánh giá, KHÔNG phải xếp hạng đã kiểm chứng có khả năng dự đoán —
+            xem mục Backtest/Hồi quy bên dưới để biết mức độ tin cậy thực tế của điểm số.
           </p>
         </div>
         <button
@@ -325,6 +329,7 @@ export default function Home() {
 
         <BacktestPanel />
         <RegressionPanel />
+        <TrainTestPanel />
       </section>
 
       <footer className="border-t border-[#1F252E] px-6 py-3 text-xs text-[#5A6270] flex items-center justify-between">
@@ -688,6 +693,187 @@ function RegressionPanel() {
               </div>
             </div>
           )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface TrainTestBucket {
+  label: string;
+  count: number;
+  avgActualReturnPct: number;
+  winRatePct: number;
+}
+
+interface TrainTestResult {
+  tickers: string[];
+  forwardDays: number;
+  trainCount: number;
+  testCount: number;
+  trainDateRange: [string, string];
+  testDateRange: [string, string];
+  trainR2: number;
+  oosR2: number;
+  oosCorrelation: number | null;
+  buckets: TrainTestBucket[];
+}
+
+function TrainTestPanel() {
+  const [forwardDays, setForwardDays] = useState(5);
+  const [result, setResult] = useState<TrainTestResult | null>(null);
+  const [ttError, setTtError] = useState<string | null>(null);
+  const [ttLoading, setTtLoading] = useState(false);
+
+  async function runTrainTest() {
+    setTtLoading(true);
+    setTtError(null);
+    setResult(null);
+    try {
+      const res = await fetch(`/api/train-test?forwardDays=${forwardDays}`);
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? "Lỗi kiểm chứng");
+      setResult(json);
+    } catch (e: any) {
+      setTtError(e.message ?? "Có lỗi xảy ra");
+    } finally {
+      setTtLoading(false);
+    }
+  }
+
+  const q1 = result?.buckets[0];
+  const q4 = result?.buckets.at(-1);
+  const monotonic =
+    result && result.buckets.length >= 2
+      ? result.buckets.every(
+          (b, i) => i === 0 || b.avgActualReturnPct >= result.buckets[i - 1].avgActualReturnPct - 0.5
+        )
+      : null;
+
+  return (
+    <div className="rounded-xl border border-[#1F252E] p-5 flex flex-col gap-4">
+      <div>
+        <div className="text-xs font-semibold tracking-[0.15em] font-[var(--font-mono)] text-[#B7C0CC]">
+          KIỂM CHỨNG TRAIN/TEST (NGHIÊM NGẶT NHẤT)
+        </div>
+        <p className="text-xs text-[#5A6270] mt-1 max-w-2xl">
+          Fit hệ số chỉ trên 70% dữ liệu CŨ HƠN (theo thời gian), rồi kiểm tra trên 30% dữ liệu MỚI HƠN
+          mà mô hình chưa từng thấy. Nếu mô hình thực sự có giá trị, nhóm được dự đoán return cao (Q4)
+          phải có return thực tế cao hơn rõ rệt so với nhóm dự đoán thấp (Q1) — kể cả trên dữ liệu chưa thấy.
+        </p>
+      </div>
+
+      <div className="flex items-center gap-2 flex-wrap">
+        <div className="flex items-center gap-1 text-xs text-[#7C8797]">
+          <span>Dự báo</span>
+          {[5, 10, 20].map((d) => (
+            <button
+              key={d}
+              onClick={() => setForwardDays(d)}
+              className="px-2 py-1 rounded border font-[var(--font-mono)] transition-colors"
+              style={{
+                borderColor: forwardDays === d ? NEUTRAL : "#262C36",
+                color: forwardDays === d ? NEUTRAL : "#7C8797",
+              }}
+            >
+              {d}p
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={runTrainTest}
+          disabled={ttLoading}
+          className="text-sm px-3 py-1.5 rounded-md border border-[#262C36] hover:border-[#3A4250] text-[#B7C0CC] disabled:opacity-50 transition-colors"
+        >
+          {ttLoading ? "Đang chạy (có thể mất 20-40s)…" : "Chạy kiểm chứng"}
+        </button>
+      </div>
+
+      {ttError && (
+        <div className="rounded-md border border-[#EA394340] bg-[#EA39430D] px-4 py-2 text-sm text-[#F2A5A9]">
+          {ttError}
+        </div>
+      )}
+
+      {result && (
+        <div className="flex flex-col gap-3">
+          <div className="text-sm text-[#9AA4B2]">
+            Train: {result.trainCount} mẫu ({result.trainDateRange[0]} → {result.trainDateRange[1]}) · Test:{" "}
+            {result.testCount} mẫu ({result.testDateRange[0]} → {result.testDateRange[1]})
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+            <Stat label="R² trên tập train" value={`${(result.trainR2 * 100).toFixed(1)}%`} />
+            <Stat
+              label="R² ngoài mẫu (test)"
+              value={`${(result.oosR2 * 100).toFixed(1)}%`}
+              color={result.oosR2 > 0 ? ACCENT : DOWN}
+            />
+            <Stat
+              label="Tương quan ngoài mẫu"
+              value={result.oosCorrelation !== null ? result.oosCorrelation.toFixed(2) : "—"}
+              color={
+                result.oosCorrelation !== null
+                  ? result.oosCorrelation > 0.1
+                    ? ACCENT
+                    : result.oosCorrelation < -0.1
+                    ? DOWN
+                    : NEUTRAL
+                  : undefined
+              }
+            />
+          </div>
+
+          {result.oosR2 < 0 && (
+            <div className="rounded-md border border-[#EA394340] bg-[#EA39430D] px-4 py-2 text-xs text-[#F2A5A9]">
+              R² ngoài mẫu ÂM nghĩa là mô hình dự đoán TỆ HƠN cả việc chỉ đoán bằng giá trị trung bình —
+              dấu hiệu rõ ràng của overfitting: mô hình học "thuộc lòng" dữ liệu train, không khái quát hoá được.
+            </div>
+          )}
+
+          <div className="overflow-x-auto rounded-lg border border-[#1F252E]">
+            <table className="w-full text-sm font-[var(--font-mono)]">
+              <thead>
+                <tr className="text-[#5A6270] text-xs">
+                  {["Nhóm (theo dự đoán)", "Số mẫu", "Return thực tế TB", "Tỷ lệ thắng"].map((h) => (
+                    <th key={h} className="text-left font-normal px-3 py-2 border-b border-[#1F252E]">
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {result.buckets.map((b) => (
+                  <tr key={b.label} className="border-b border-[#161B22] last:border-0">
+                    <td className="px-3 py-2 text-[#E7EAEE]">{b.label}</td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">{b.count}</td>
+                    <td
+                      className="px-3 py-2"
+                      style={{ color: b.avgActualReturnPct >= 0 ? ACCENT : DOWN }}
+                    >
+                      {b.avgActualReturnPct >= 0 ? "+" : ""}
+                      {fmt(b.avgActualReturnPct)}%
+                    </td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">{fmt(b.winRatePct, 0)}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {q1 && q4 && (
+            <p className="text-xs" style={{ color: monotonic ? ACCENT : "#7C8797" }}>
+              {monotonic
+                ? `Q4 (dự đoán cao nhất) có return thực tế ${fmt(q4.avgActualReturnPct)}% so với Q1 (dự đoán thấp nhất) ${fmt(q1.avgActualReturnPct)}% — nhóm dự đoán cao hơn thực sự cho kết quả tốt hơn trên dữ liệu chưa thấy.`
+                : "Thứ tự các nhóm KHÔNG đơn điệu tăng dần — mô hình chưa cho thấy khả năng phân biệt đáng tin trên dữ liệu ngoài mẫu."}
+            </p>
+          )}
+
+          <p className="text-xs text-[#5A6270]">
+            Đây là bài kiểm tra nghiêm ngặt nhất trong app: mô hình hoàn toàn KHÔNG thấy dữ liệu test khi
+            fit. Nếu R² ngoài mẫu gần 0 hoặc âm, kết luận hợp lý là bộ chỉ báo hiện tại không đủ sức dự
+            đoán return ngắn hạn cho nhóm cổ phiếu này — đó là một kết luận khoa học hợp lệ, không phải
+            thất bại của việc xây dựng hệ thống. Không phải khuyến nghị đầu tư.
+          </p>
         </div>
       )}
     </div>
