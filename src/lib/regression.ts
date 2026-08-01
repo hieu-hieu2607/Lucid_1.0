@@ -25,6 +25,26 @@ export interface RegressionResult {
   predictions: PredictedPick[];
 }
 
+export interface TrainTestBucket {
+  label: string;
+  count: number;
+  avgActualReturnPct: number;
+  winRatePct: number;
+}
+
+export interface TrainTestResult {
+  tickers: string[];
+  forwardDays: number;
+  trainCount: number;
+  testCount: number;
+  trainDateRange: [string, string];
+  testDateRange: [string, string];
+  trainR2: number;
+  oosR2: number;
+  oosCorrelation: number | null;
+  buckets: TrainTestBucket[];
+}
+
 /**
  * Mỗi feature ứng với 1 "quy tắc" đang dùng trong computeScoreFromHistory
  * (analyze.ts), viết lại dưới dạng biến số liên tục thay vì các dải rời rạc,
@@ -125,6 +145,25 @@ function twoTailedPValue(tStat: number): number {
   return 2 * (1 - normalCdf(Math.abs(tStat)));
 }
 
+function pearsonCorrelation(xs: number[], ys: number[]): number | null {
+  const n = xs.length;
+  if (n < 3) return null;
+  const meanX = xs.reduce((a, b) => a + b, 0) / n;
+  const meanY = ys.reduce((a, b) => a + b, 0) / n;
+  let num = 0;
+  let denX = 0;
+  let denY = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - meanX;
+    const dy = ys[i] - meanY;
+    num += dx * dy;
+    denX += dx * dx;
+    denY += dy * dy;
+  }
+  const den = Math.sqrt(denX * denY);
+  return den > 0 ? num / den : null;
+}
+
 /**
  * Hồi quy tuyến tính bội (OLS) qua phương trình chuẩn (XᵀX)β = XᵀY, kèm sai số
  * chuẩn và p-value cho từng hệ số — để biết hệ số nào thực sự có ý nghĩa
@@ -177,19 +216,24 @@ function ols(
   return { coefs, standardErrors, pValues, r2 };
 }
 
+interface Sample {
+  date: string;
+  ticker: string;
+  features: number[];
+  forwardReturn: number;
+}
+
 /**
- * Chạy backtest gộp qua nhiều mã, trích đặc trưng từ mỗi mốc thời gian, fit
- * hồi quy tuyến tính để xem hướng chấm điểm nào thực sự được dữ liệu ủng hộ
- * (kèm p-value), rồi áp mô hình đã fit vào dữ liệu MỚI NHẤT của từng mã để
- * đưa ra "return kỳ vọng" — một cách chấm điểm khác, dựa trên số liệu thống
- * kê thay vì trọng số tự chọn. Đây vẫn là mô hình fit trong-mẫu (in-sample),
- * chưa kiểm chứng ngoài mẫu, nên coi là thử nghiệm, không phải kết luận chắc
- * chắn.
+ * Lấy dữ liệu 500 ngày cho toàn bộ watchlist (theo từng đợt nhỏ để không quá
+ * tải nguồn dữ liệu), rồi trích mẫu (features, forward return, ngày) tại
+ * nhiều mốc thời gian quá khứ cho từng mã — dùng chung cho cả
+ * runWeightRegression (fit trên toàn bộ) và runTrainTestSplit (fit/test
+ * tách theo thời gian).
  */
-export async function runWeightRegression(
+async function gatherSamples(
   tickers: string[],
-  forwardDays = 5
-): Promise<RegressionResult | null> {
+  forwardDays: number
+): Promise<{ samples: Sample[]; histories: { ticker: string; history: any }[] }> {
   const fns = await getVnstock();
   const lookbackCalendarDays = 500;
   const start = new Date();
@@ -220,7 +264,7 @@ export async function runWeightRegression(
           h = trimUnclosedBar(h);
           return { ticker, history: h };
         } catch (err) {
-          console.error(`runWeightRegression: lỗi khi lấy dữ liệu ${ticker}`, err);
+          console.error(`gatherSamples: lỗi khi lấy dữ liệu ${ticker}`, err);
           return { ticker, history: null };
         }
       })
@@ -229,12 +273,9 @@ export async function runWeightRegression(
   }
 
   const validCount = histories.filter((h) => h.history && h.history.length >= 120).length;
-  console.log(
-    `[runWeightRegression] ${validCount}/${tickers.length} mã lấy dữ liệu thành công (đủ >=120 phiên)`
-  );
+  console.log(`[gatherSamples] ${validCount}/${tickers.length} mã lấy dữ liệu thành công`);
 
-  const X: number[][] = [];
-  const y: number[] = [];
+  const samples: Sample[] = [];
   const stepDays = 5;
   const minStart = 90;
 
@@ -245,16 +286,36 @@ export async function runWeightRegression(
       const slice = history.slice(0, cutoff + 1);
       const result = computeScoreFromHistory(ticker, slice, vniChg5dAt(history, cutoff), null, fns);
       if (!result) continue;
-      const forwardReturnPct = pctChange(history[cutoff].close, history[cutoff + forwardDays].close);
-      X.push(FEATURES.map((f) => f.extract(result)));
-      y.push(forwardReturnPct);
+      const forwardReturn = pctChange(history[cutoff].close, history[cutoff + forwardDays].close);
+      samples.push({
+        date: String(history[cutoff].date).slice(0, 10),
+        ticker,
+        features: FEATURES.map((f) => f.extract(result)),
+        forwardReturn,
+      });
     }
   }
 
-  console.log(`[runWeightRegression] thu được ${X.length} mẫu (cần >= ${FEATURES.length * 10})`);
+  console.log(`[gatherSamples] thu được ${samples.length} mẫu`);
+  return { samples, histories };
+}
 
-  if (X.length < FEATURES.length * 10) return null; // không đủ mẫu để hồi quy đáng tin cậy
+/**
+ * Fit hồi quy trên TOÀN BỘ dữ liệu backtest gộp, rồi áp hệ số vào dữ liệu MỚI
+ * NHẤT của từng mã để đưa ra "return kỳ vọng" — dùng để CHẨN ĐOÁN hướng chấm
+ * điểm, không phải kiểm chứng nghiêm ngặt (xem runTrainTestSplit cho việc đó).
+ */
+export async function runWeightRegression(
+  tickers: string[],
+  forwardDays = 5
+): Promise<RegressionResult | null> {
+  const fns = await getVnstock();
+  const { samples, histories } = await gatherSamples(tickers, forwardDays);
 
+  if (samples.length < FEATURES.length * 10) return null; // không đủ mẫu để hồi quy đáng tin cậy
+
+  const X = samples.map((s) => s.features);
+  const y = samples.map((s) => s.forwardReturn);
   const fit = ols(X, y);
   if (!fit) {
     console.error(
@@ -264,13 +325,14 @@ export async function runWeightRegression(
   }
 
   // Áp hệ số vừa fit vào dữ liệu MỚI NHẤT (toàn bộ history, không cắt) của
-  // từng mã để ra "return kỳ vọng" hôm nay — đây là "phán đoán" dựa trên mô
-  // hình thống kê thay vì công thức chấm điểm cũ.
+  // từng mã để ra "return kỳ vọng" hôm nay. vniChg5d truyền null vì việc tính
+  // lại chỉ số VNINDEX tương ứng nằm trong gatherSamples (đã đóng lại phạm vi
+  // sau khi trả về) — computeScoreFromHistory xử lý null an toàn, chỉ khiến
+  // riêng feature "sức mạnh tương đối" của bước dự đoán hôm nay mặc định 0.
   const predictions: PredictedPick[] = [];
   for (const { ticker, history } of histories) {
     if (!history || history.length < 120) continue;
-    const cutoff = history.length - 1;
-    const result = computeScoreFromHistory(ticker, history, vniChg5dAt(history, cutoff), null, fns);
+    const result = computeScoreFromHistory(ticker, history, null, null, fns);
     if (!result) continue;
     const features = FEATURES.map((f) => f.extract(result));
     const predictedReturnPct = features.reduce((s, xi, i) => s + xi * fit.coefs[i], 0);
@@ -292,5 +354,96 @@ export async function runWeightRegression(
       significant: fit.pValues[i] !== null && (fit.pValues[i] as number) < 0.05,
     })),
     predictions,
+  };
+}
+
+/** Chia mẫu thành các nhóm (quartile) theo giá trị dự đoán, rồi tính return thật + tỷ lệ thắng trong từng nhóm. */
+function quantileBuckets(predicted: number[], actual: number[], numBuckets = 4): TrainTestBucket[] {
+  const order = predicted.map((_, i) => i).sort((a, b) => predicted[a] - predicted[b]);
+  const n = order.length;
+  const size = Math.floor(n / numBuckets);
+  const buckets: TrainTestBucket[] = [];
+  for (let b = 0; b < numBuckets; b++) {
+    const startI = b * size;
+    const endI = b === numBuckets - 1 ? n : (b + 1) * size;
+    const idx = order.slice(startI, endI);
+    if (idx.length === 0) continue;
+    const avgPred = idx.reduce((s, i) => s + predicted[i], 0) / idx.length;
+    const avgActual = idx.reduce((s, i) => s + actual[i], 0) / idx.length;
+    const winRate = (idx.filter((i) => actual[i] > 0).length / idx.length) * 100;
+    buckets.push({
+      label: `Q${b + 1} — dự đoán TB ${avgPred >= 0 ? "+" : ""}${avgPred.toFixed(2)}%`,
+      count: idx.length,
+      avgActualReturnPct: avgActual,
+      winRatePct: winRate,
+    });
+  }
+  return buckets;
+}
+
+/**
+ * Kiểm chứng NGHIÊM NGẶT: tách dữ liệu theo THỜI GIAN — fit hệ số chỉ trên
+ * `trainFraction` mẫu CŨ HƠN, rồi áp mô hình đó vào phần mẫu MỚI HƠN mà mô
+ * hình chưa từng thấy (out-of-sample). Nếu mô hình thực sự có giá trị, nhóm
+ * được dự đoán return cao (Q4) phải có return thực tế trung bình VÀ tỷ lệ
+ * thắng cao hơn rõ rệt so với nhóm dự đoán thấp (Q1). Tách theo thời gian
+ * (không phải ngẫu nhiên) vì đây là time-series — tách ngẫu nhiên sẽ rò rỉ
+ * thông tin giữa các mốc gần nhau.
+ */
+export async function runTrainTestSplit(
+  tickers: string[],
+  forwardDays = 5,
+  trainFraction = 0.7
+): Promise<TrainTestResult | null> {
+  const { samples } = await gatherSamples(tickers, forwardDays);
+
+  if (samples.length < FEATURES.length * 20) return null; // cần đủ cho cả train lẫn test
+
+  const sorted = [...samples].sort((a, b) => a.date.localeCompare(b.date));
+  const splitIdx = Math.floor(sorted.length * trainFraction);
+  const train = sorted.slice(0, splitIdx);
+  const test = sorted.slice(splitIdx);
+
+  console.log(
+    `[runTrainTestSplit] train=${train.length} (${train[0]?.date}→${train.at(-1)?.date}), test=${test.length} (${test[0]?.date}→${test.at(-1)?.date})`
+  );
+
+  if (train.length < FEATURES.length * 10 || test.length < 20) return null;
+
+  const fit = ols(
+    train.map((s) => s.features),
+    train.map((s) => s.forwardReturn)
+  );
+  if (!fit) {
+    console.error("[runTrainTestSplit] ols() trên tập train thất bại — ma trận suy biến");
+    return null;
+  }
+
+  const testX = test.map((s) => s.features);
+  const testY = test.map((s) => s.forwardReturn);
+  const predY = testX.map((x) => x.reduce((s, xi, i) => s + xi * fit.coefs[i], 0));
+
+  const testMean = testY.reduce((a, b) => a + b, 0) / testY.length;
+  let ssRes = 0;
+  let ssTot = 0;
+  for (let i = 0; i < testY.length; i++) {
+    ssRes += (testY[i] - predY[i]) ** 2;
+    ssTot += (testY[i] - testMean) ** 2;
+  }
+  const oosR2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
+  const oosCorrelation = pearsonCorrelation(predY, testY);
+  const buckets = quantileBuckets(predY, testY, 4);
+
+  return {
+    tickers,
+    forwardDays,
+    trainCount: train.length,
+    testCount: test.length,
+    trainDateRange: [train[0].date, train.at(-1)!.date],
+    testDateRange: [test[0].date, test.at(-1)!.date],
+    trainR2: fit.r2,
+    oosR2,
+    oosCorrelation,
+    buckets,
   };
 }
