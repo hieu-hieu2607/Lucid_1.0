@@ -674,13 +674,17 @@ export async function runAnalysis(universe: string[] = DEFAULT_UNIVERSE) {
   ]);
   console.log(`[runAnalysis] xong market breadth + khối ngoại sau ${Date.now() - t0}ms`);
 
-  // Chia nhỏ theo từng đợt thay vì gọi tất cả cùng lúc — nếu nguồn dữ liệu
-  // giới hạn số request đồng thời từ cùng 1 IP, gọi hết 20 mã song song có
-  // thể khiến chúng bị xếp hàng phía server và cộng dồn thời gian, dễ vượt
-  // giới hạn 60s của serverless function.
-  const BATCH_SIZE = 6;
+  // Chia nhỏ theo từng đợt thay vì gọi tất cả cùng lúc. Log thực tế cho thấy:
+  // 12 request đầu (2 đợt x 6) hoàn thành gần như tức thì, nhưng ngay đợt thứ 3
+  // (request 13-18) hàng loạt bị treo đúng 15s — dấu hiệu điển hình của việc bị
+  // giới hạn tốc độ (rate limit) từ phía nguồn dữ liệu sau một chuỗi request dồn
+  // dập, không phải lỗi ngẫu nhiên. Giảm batch nhỏ hơn (3) + nghỉ giữa các đợt để
+  // tránh dồn dập chạm ngưỡng đó.
+  const BATCH_SIZE = 3;
+  const BATCH_DELAY_MS = 500;
   const shortTermSettled: (ShortTermResult | null)[] = [];
   for (let i = 0; i < universe.length; i += BATCH_SIZE) {
+    if (i > 0) await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY_MS));
     const batch = universe.slice(i, i + BATCH_SIZE);
     const batchResults = await Promise.all(
       batch.map((t) => scoreShortTerm(t, marketBreadth?.chg5d ?? null, foreignFlow.get(t) ?? null))
