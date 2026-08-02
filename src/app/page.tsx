@@ -1,717 +1,897 @@
-import os from "os";
-import path from "path";
-import { getVnstock } from "./vnstock-client";
+"use client";
 
-// Rổ mã mặc định để quét — có thể mở rộng sau (VN30 tiêu biểu, thanh khoản tốt)
-export const DEFAULT_UNIVERSE = [
-  "VCB", "MBB", "TCB", "CTG", "BID", "ACB", "VPB", "STB",
-  "FPT", "HPG", "VIC", "VHM", "VNM", "MSN", "MWG", "PNJ",
-  "GAS", "POW", "SSI", "VRE",
-];
+import { useEffect, useState } from "react";
 
-export interface MarketBreadth {
+interface MarketBreadth {
   trend: "bull" | "bear" | "neutral";
   chg1d: number;
   chg5d: number;
-  adjustment: number; // điểm cộng/trừ áp cho toàn bộ watchlist
+  adjustment: number;
 }
 
-export interface OhlcvBar {
-  date: string | Date;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-}
-
-export interface ShortTermResult {
+interface ShortTermResult {
   ticker: string;
   score: number;
   lastClose: number | null;
   rsi14: number | null;
   macdHistogram: number | null;
-  macdRising: boolean | null; // histogram đang tăng dần (động lượng tăng tốc)
+  macdRising: boolean | null;
   sma20: number | null;
   sma50: number | null;
-  priceVsSma20Pct: number | null; // giá lệch SMA20 bao nhiêu %
-  trendAligned: boolean | null; // giá > SMA20 > SMA50 (xu hướng tăng rõ ràng)
+  priceVsSma20Pct: number | null;
+  trendAligned: boolean | null;
   superTrend: "bullish" | "bearish" | null;
-  bollingerPercentB: number | null; // vị trí trong dải Bollinger (0=dải dưới, 1=dải trên)
-  atrPercent: number | null; // ATR / giá — đo biến động tương đối (rủi ro)
-  adx: number | null; // độ mạnh xu hướng (ADX > 25: mạnh, < 20: yếu/đi ngang)
-  adxBullish: boolean | null; // DI+ > DI- (phe mua đang thắng thế)
-  volumeRatio: number | null; // volume gần nhất / TB 20 phiên
-  priceChange5d: number | null; // % thay đổi giá 5 phiên gần nhất
-  foreignNetRatio: number | null; // (mua ròng - bán ròng khối ngoại) / tổng KL, %
-  relativeStrength5d: number | null; // % tăng giá 5 phiên của mã trừ % của VNINDEX
-  rsiBullDiv: boolean; // phân kỳ tăng trên RSI (đảo chiều sớm)
-  rsiBearDiv: boolean; // phân kỳ giảm trên RSI
-  macdBullDiv: boolean; // phân kỳ tăng trên MACD histogram
-  macdBearDiv: boolean; // phân kỳ giảm trên MACD histogram
+  bollingerPercentB: number | null;
+  atrPercent: number | null;
+  adx: number | null;
+  adxBullish: boolean | null;
+  volumeRatio: number | null;
+  priceChange5d: number | null;
+  foreignNetRatio: number | null;
+  relativeStrength5d: number | null;
+  rsiBullDiv: boolean;
+  rsiBearDiv: boolean;
+  macdBullDiv: boolean;
+  macdBearDiv: boolean;
   stopLoss: number | null;
   target1: number | null;
-  riskReward: number | null; // (target1 - giá) / (giá - stopLoss)
+  riskReward: number | null;
   reason: string;
 }
 
-export function pctChange(from: number, to: number): number {
-  if (!from) return 0;
-  return ((to - from) / from) * 100;
+interface AnalysisResponse {
+  generatedAt: string;
+  marketBreadth: MarketBreadth | null;
+  shortTerm: { best: ShortTermResult | null; ranked: ShortTermResult[] };
 }
 
-function stdev(arr: number[]): number {
-  if (arr.length === 0) return 0;
-  const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
-  const variance = arr.reduce((a, b) => a + (b - mean) ** 2, 0) / arr.length;
-  return Math.sqrt(variance);
-}
-
-/** Giờ Việt Nam hiện tại có đang trong phiên giao dịch không (9h-15h, T2-T6)? */
-function isVnMarketHoursNow(): boolean {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "Asia/Ho_Chi_Minh",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-    weekday: "short",
-  }).formatToParts(new Date());
-  const map: Record<string, string> = {};
-  parts.forEach((p) => (map[p.type] = p.value));
-  const minutesNow = parseInt(map.hour, 10) * 60 + parseInt(map.minute, 10);
-  const isWeekday = map.weekday !== "Sat" && map.weekday !== "Sun";
-  return isWeekday && minutesNow >= 9 * 60 && minutesNow < 15 * 60;
-}
-
-/** Ngày hôm nay theo giờ Việt Nam, dạng YYYY-MM-DD. */
-function vnTodayDateString(): string {
-  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Ho_Chi_Minh" }).format(new Date());
+function fmt(n: number | null | undefined, digits = 1): string {
+  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  return n.toFixed(digits);
 }
 
 /**
- * Số giây cho tới lần mở cửa thị trường VN tiếp theo (9h sáng ngày làm việc
- * gần nhất). Trả về 0 nếu đang trong giờ giao dịch (không cần cache dài).
- * Dùng để cache dữ liệu cuối tuần: vì T7/CN thị trường đóng cửa, dữ liệu
- * không đổi — cache tới sáng T2 giúp cuối tuần không cần gọi API sống nữa,
- * tránh phụ thuộc vào việc nguồn dữ liệu bên ngoài có ổn định ngoài giờ hay
- * không.
+ * fetch + parse JSON an toàn: khi server trả về lỗi không phải JSON (VD:
+ * trang HTML lỗi 504 timeout của Vercel), ném lỗi dễ hiểu thay vì để
+ * JSON.parse tự crash với thông báo khó hiểu.
  */
-export function secondsUntilNextMarketOpen(): number {
-  const ictOffsetMs = 7 * 60 * 60 * 1000; // giờ VN cố định UTC+7, không DST
-  const nowUtcMs = Date.now();
-  const nowIct = new Date(nowUtcMs + ictOffsetMs);
-  const y = nowIct.getUTCFullYear();
-  const m = nowIct.getUTCMonth();
-  const d = nowIct.getUTCDate();
-  const weekday = nowIct.getUTCDay(); // 0=CN .. 6=T7 (theo mốc giờ đã dịch sang ICT)
-  const minutesNow = nowIct.getUTCHours() * 60 + nowIct.getUTCMinutes();
-
-  if (weekday >= 1 && weekday <= 5 && minutesNow >= 9 * 60 && minutesNow < 15 * 60) {
-    return 0; // đang trong giờ giao dịch — không cần cache dài
-  }
-
-  function marketOpenUtcMs(dayOffset: number): number {
-    return Date.UTC(y, m, d + dayOffset, 9, 0, 0) - ictOffsetMs;
-  }
-
-  let dayOffset = 0;
-  for (let i = 0; i <= 10; i++) {
-    const candidateWeekday = (weekday + dayOffset) % 7;
-    const isWeekday = candidateWeekday >= 1 && candidateWeekday <= 5;
-    if (isWeekday && marketOpenUtcMs(dayOffset) > nowUtcMs) break;
-    dayOffset++;
-  }
-
-  return Math.max(60, Math.round((marketOpenUtcMs(dayOffset) - nowUtcMs) / 1000));
-}
-
-/** Thử lại khi gọi mạng thất bại (timeout, rate-limit tạm thời...), có độ trễ tăng dần. */
-export async function withRetry<T>(fn: () => Promise<T>, retries = 2, baseDelayMs = 800): Promise<T> {
-  let lastErr: unknown;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      if (attempt < retries) {
-        await new Promise((resolve) => setTimeout(resolve, baseDelayMs * (attempt + 1)));
-      }
-    }
-  }
-  throw lastErr;
-}
-
-/** Bỏ nến "hôm nay" nếu phiên chưa đóng cửa (xem giải thích ở scoreShortTerm). */
-export function trimUnclosedBar<T extends { date: string | Date }>(bars: T[]): T[] {
-  if (!isVnMarketHoursNow()) return bars;
-  const today = vnTodayDateString();
-  const last = bars.at(-1);
-  if (last && String(last.date).slice(0, 10) === today) {
-    return bars.slice(0, -1);
-  }
-  return bars;
-}
-
-/**
- * ADX / DI+ / DI- (Wilder) — đo ĐỘ MẠNH của xu hướng, không phải chiều xu hướng.
- * vnstock-js không có sẵn nên tự tính từ OHLC (công thức Wilder chuẩn, xấp xỉ
- * bằng EMA alpha=1/period).
- */
-function computeADX(
-  bars: { high: number; low: number; close: number }[],
-  period = 14
-): { adx: number | null; diPlus: number | null; diMinus: number | null } {
-  if (bars.length < period * 2) return { adx: null, diPlus: null, diMinus: null };
-
-  const tr: number[] = [];
-  const plusDM: number[] = [];
-  const minusDM: number[] = [];
-
-  for (let i = 1; i < bars.length; i++) {
-    const upMove = bars[i].high - bars[i - 1].high;
-    const downMove = bars[i - 1].low - bars[i].low;
-    plusDM.push(upMove > downMove && upMove > 0 ? upMove : 0);
-    minusDM.push(downMove > upMove && downMove > 0 ? downMove : 0);
-    tr.push(
-      Math.max(
-        bars[i].high - bars[i].low,
-        Math.abs(bars[i].high - bars[i - 1].close),
-        Math.abs(bars[i].low - bars[i - 1].close)
-      )
+async function safeFetchJson(url: string): Promise<any> {
+  const res = await fetch(url);
+  const text = await res.text();
+  let json: any;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(
+      res.status === 504
+        ? "Yêu cầu quá lâu (vượt giới hạn thời gian của server) — thử lại hoặc giảm phạm vi dữ liệu."
+        : `Server trả về dữ liệu không hợp lệ (status ${res.status}): ${text.slice(0, 150)}`
     );
   }
+  if (!res.ok) throw new Error(json.error ?? "Có lỗi xảy ra");
+  return json;
+}
 
-  const wilderSmooth = (arr: number[]): number[] => {
-    const alpha = 1 / period;
-    const out: number[] = [arr[0]];
-    for (let i = 1; i < arr.length; i++) {
-      out.push(alpha * arr[i] + (1 - alpha) * out[i - 1]);
+function divergenceLabel(row: ShortTermResult): { text: string; color?: string } {
+  const bull = row.rsiBullDiv || row.macdBullDiv;
+  const bear = row.rsiBearDiv || row.macdBearDiv;
+  if (bull && bear) return { text: "Hỗn hợp" };
+  if (bull) return { text: "Tăng ↑", color: ACCENT };
+  if (bear) return { text: "Giảm ↓", color: DOWN };
+  return { text: "—" };
+}
+
+const ACCENT = "#16C784";
+const DOWN = "#EA3943";
+const NEUTRAL = "#F0B90B";
+
+export default function Home() {
+  const [data, setData] = useState<AnalysisResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/analyze");
+      const text = await res.text();
+      let json: any;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        throw new Error(
+          `Server trả về dữ liệu không hợp lệ (status ${res.status}): ${text.slice(0, 200)}`
+        );
+      }
+      if (!res.ok) throw new Error(json.error ?? "Lỗi tải dữ liệu");
+      setData(json);
+    } catch (e: any) {
+      setError(e.message ?? "Có lỗi xảy ra");
+    } finally {
+      setLoading(false);
     }
-    return out;
-  };
-
-  const atrSm = wilderSmooth(tr);
-  const plusSm = wilderSmooth(plusDM);
-  const minusSm = wilderSmooth(minusDM);
-
-  const diPlusSeries = plusSm.map((v, i) => (atrSm[i] ? (100 * v) / atrSm[i] : 0));
-  const diMinusSeries = minusSm.map((v, i) => (atrSm[i] ? (100 * v) / atrSm[i] : 0));
-  const dxSeries = diPlusSeries.map((v, i) => {
-    const sum = v + diMinusSeries[i];
-    return sum ? (100 * Math.abs(v - diMinusSeries[i])) / sum : 0;
-  });
-  const adxSeries = wilderSmooth(dxSeries);
-
-  return {
-    adx: adxSeries.at(-1) ?? null,
-    diPlus: diPlusSeries.at(-1) ?? null,
-    diMinus: diMinusSeries.at(-1) ?? null,
-  };
-}
-
-/** Tìm chỉ số các đỉnh cục bộ (pivot highs): lớn hơn `order` điểm cả 2 phía. */
-function findPivotHighIdx(values: number[], order: number): number[] {
-  const idxs: number[] = [];
-  for (let i = order; i < values.length - order; i++) {
-    const window = values.slice(i - order, i + order + 1);
-    if (values[i] === Math.max(...window)) idxs.push(i);
-  }
-  return idxs;
-}
-
-/** Tìm chỉ số các đáy cục bộ (pivot lows). */
-function findPivotLowIdx(values: number[], order: number): number[] {
-  const idxs: number[] = [];
-  for (let i = order; i < values.length - order; i++) {
-    const window = values.slice(i - order, i + order + 1);
-    if (values[i] === Math.min(...window)) idxs.push(i);
-  }
-  return idxs;
-}
-
-/**
- * Phát hiện phân kỳ (divergence) bằng cách so 2 pivot gần nhất của giá và của
- * chỉ báo trong `lookback` phiên gần nhất — tín hiệu đảo chiều SỚM, khác hẳn
- * loại tín hiệu "đọc mức giá trị hiện tại" như RSI/MACD ở trên.
- *
- * Ngưỡng "chênh lệch đáng kể" của chỉ báo được tính theo độ lệch chuẩn cục bộ
- * (thay vì số tuyệt đối như "3 điểm" cố định) để dùng chung được cho cả RSI
- * (thang 0-100) lẫn MACD histogram (thang nhỏ hơn nhiều, có thể âm).
- */
-function detectDivergence(
-  price: number[],
-  indicator: number[],
-  order = 5,
-  lookback = 60
-): { bullish: boolean; bearish: boolean } {
-  const n = price.length;
-  if (n < lookback + order * 2) return { bullish: false, bearish: false };
-
-  const p = price.slice(n - lookback);
-  const ind = indicator.slice(n - lookback);
-  if (ind.some((v) => Number.isNaN(v))) return { bullish: false, bearish: false };
-
-  const epsilon = Math.max(stdev(ind) * 0.3, 0.01);
-
-  const priceHighIdx = findPivotHighIdx(p, order);
-  const indHighIdx = findPivotHighIdx(ind, order);
-  let bearish = false;
-  if (priceHighIdx.length >= 2 && indHighIdx.length >= 2) {
-    const p2 = p[priceHighIdx.at(-1)!];
-    const p1 = p[priceHighIdx.at(-2)!];
-    const i2 = ind[indHighIdx.at(-1)!];
-    const i1 = ind[indHighIdx.at(-2)!];
-    if (p2 > p1 * 1.005 && i2 < i1 - epsilon) bearish = true;
   }
 
-  const priceLowIdx = findPivotLowIdx(p, order);
-  const indLowIdx = findPivotLowIdx(ind, order);
-  let bullish = false;
-  if (priceLowIdx.length >= 2 && indLowIdx.length >= 2) {
-    const p2 = p[priceLowIdx.at(-1)!];
-    const p1 = p[priceLowIdx.at(-2)!];
-    const i2 = ind[indLowIdx.at(-1)!];
-    const i1 = ind[indLowIdx.at(-2)!];
-    if (p2 < p1 * 0.995 && i2 > i1 + epsilon) bullish = true;
+  useEffect(() => {
+    load();
+  }, []);
+
+  const best = data?.shortTerm.best ?? null;
+  const ranked = data?.shortTerm.ranked ?? [];
+  const breadth = data?.marketBreadth ?? null;
+  const bestDiv = best ? divergenceLabel(best) : null;
+
+  return (
+    <main className="flex-1 flex flex-col">
+      <header className="border-b border-[#1F252E] px-6 py-5 flex items-center justify-between">
+        <div>
+          <h1 className="font-[var(--font-display)] text-xl font-bold tracking-tight">
+            Lucid Dream
+          </h1>
+          <p className="text-sm text-[#7C8797] mt-0.5">
+            Bảng chỉ báo kỹ thuật tổng hợp cho lướt sóng — xu hướng, động lượng, biến động, khối lượng, khối ngoại.
+          </p>
+          <p className="text-xs text-[#5A6270] mt-1 max-w-2xl">
+            Đây là công cụ tổng hợp chỉ báo để bạn tự đánh giá, KHÔNG phải xếp hạng đã kiểm chứng có khả năng dự đoán —
+            xem mục Backtest/Hồi quy bên dưới để biết mức độ tin cậy thực tế của điểm số.
+          </p>
+        </div>
+        <button
+          onClick={load}
+          disabled={loading}
+          className="text-sm px-3 py-1.5 rounded-md border border-[#262C36] hover:border-[#3A4250] text-[#B7C0CC] disabled:opacity-50 transition-colors"
+        >
+          {loading ? "Đang quét…" : "Quét lại"}
+        </button>
+      </header>
+
+      {error && (
+        <div className="mx-6 mt-4 rounded-md border border-[#EA394340] bg-[#EA39430D] px-4 py-3 text-sm text-[#F2A5A9]">
+          {error}
+        </div>
+      )}
+
+      {breadth && (
+        <div
+          className="mx-6 mt-4 rounded-md border px-4 py-2 text-xs flex items-center gap-2"
+          style={{
+            borderColor: `${breadth.trend === "bull" ? ACCENT : breadth.trend === "bear" ? DOWN : "#262C36"}40`,
+            background: `${breadth.trend === "bull" ? ACCENT : breadth.trend === "bear" ? DOWN : "#262C36"}0D`,
+            color: breadth.trend === "bull" ? ACCENT : breadth.trend === "bear" ? DOWN : "#9AA4B2",
+          }}
+        >
+          <span className="font-[var(--font-mono)] font-semibold">
+            VNINDEX {breadth.chg1d >= 0 ? "+" : ""}
+            {fmt(breadth.chg1d)}%
+          </span>
+          <span className="text-[#7C8797]">
+            {breadth.trend === "bull"
+              ? `Thị trường tích cực — đã cộng ${breadth.adjustment} điểm cho toàn bộ watchlist`
+              : breadth.trend === "bear"
+              ? `Thị trường tiêu cực — đã trừ ${Math.abs(breadth.adjustment)} điểm cho toàn bộ watchlist`
+              : "Thị trường trung tính — không điều chỉnh điểm"}
+          </span>
+        </div>
+      )}
+
+      <section className="p-6 flex flex-col gap-6 max-w-6xl w-full mx-auto">
+        <div className="flex items-baseline gap-2 flex-wrap">
+          <span
+            className="text-xs font-semibold tracking-[0.15em] font-[var(--font-mono)]"
+            style={{ color: ACCENT }}
+          >
+            LƯỚT SÓNG
+          </span>
+          <span className="text-xs text-[#5A6270]">
+            Xu hướng (SMA/SuperTrend/ADX) · Động lượng (RSI/MACD + phân kỳ) · Biến động (Bollinger/ATR) · Khối lượng · Khối ngoại · VNINDEX
+          </span>
+        </div>
+
+        {loading && !best && (
+          <div className="text-sm text-[#5A6270] font-[var(--font-mono)] animate-pulse">
+            Đang tải dữ liệu…
+          </div>
+        )}
+
+        {best && (
+          <div
+            className="rounded-xl border p-5 flex flex-col gap-4"
+            style={{ borderColor: `${ACCENT}40`, background: `${ACCENT}0D` }}
+          >
+            <div className="flex items-start justify-between flex-wrap gap-3">
+              <div>
+                <div className="text-3xl font-[var(--font-display)] font-bold">
+                  {best.ticker}
+                </div>
+                <p className="text-sm text-[#9AA4B2] mt-1 max-w-2xl">{best.reason}</p>
+              </div>
+              <div className="text-right shrink-0">
+                <div
+                  className="text-4xl font-[var(--font-mono)] font-bold"
+                  style={{ color: ACCENT }}
+                >
+                  {best.score}
+                </div>
+                <div className="text-xs text-[#5A6270]">điểm tổng hợp / 100 (tham khảo)</div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <Stat label="Giá đóng cửa" value={best.lastClose ? `${fmt(best.lastClose)}k` : "—"} />
+              <Stat
+                label="Xu hướng SMA20/50"
+                value={best.trendAligned === null ? "—" : best.trendAligned ? "Thuận" : "Chưa thuận"}
+                color={best.trendAligned === true ? ACCENT : best.trendAligned === false ? DOWN : undefined}
+              />
+              <Stat
+                label="SuperTrend"
+                value={best.superTrend === "bullish" ? "Tăng" : best.superTrend === "bearish" ? "Giảm" : "—"}
+                color={best.superTrend === "bullish" ? ACCENT : best.superTrend === "bearish" ? DOWN : undefined}
+              />
+              <Stat
+                label="ADX (độ mạnh xu hướng)"
+                value={best.adx !== null ? `${fmt(best.adx, 0)}${best.adxBullish ? " ↑" : best.adxBullish === false ? " ↓" : ""}` : "—"}
+                color={best.adx !== null && best.adx > 25 ? (best.adxBullish ? ACCENT : DOWN) : undefined}
+              />
+              <Stat label="RSI (14)" value={fmt(best.rsi14)} />
+              <Stat
+                label="MACD hist."
+                value={`${fmt(best.macdHistogram, 2)}${best.macdRising ? " ↑" : ""}`}
+              />
+              <Stat
+                label="Phân kỳ"
+                value={bestDiv!.text}
+                color={bestDiv!.color}
+              />
+              <Stat label="Bollinger %B" value={fmt(best.bollingerPercentB, 2)} />
+              <Stat label="ATR / giá" value={best.atrPercent !== null ? `${fmt(best.atrPercent)}%` : "—"} />
+              <Stat label="KL / TB20" value={best.volumeRatio ? `${fmt(best.volumeRatio, 2)}x` : "—"} />
+              <Stat
+                label="Khối ngoại (ròng/tổng KL)"
+                value={best.foreignNetRatio !== null ? `${best.foreignNetRatio >= 0 ? "+" : ""}${fmt(best.foreignNetRatio)}%` : "—"}
+                color={best.foreignNetRatio !== null ? (best.foreignNetRatio > 3 ? ACCENT : best.foreignNetRatio < -3 ? DOWN : undefined) : undefined}
+              />
+              <Stat
+                label="Sức mạnh vs VNINDEX"
+                value={best.relativeStrength5d !== null ? `${best.relativeStrength5d >= 0 ? "+" : ""}${fmt(best.relativeStrength5d)}%` : "—"}
+                color={best.relativeStrength5d !== null ? (best.relativeStrength5d > 1 ? ACCENT : best.relativeStrength5d < -1 ? DOWN : undefined) : undefined}
+              />
+              <Stat label="Δ giá 5 phiên" value={`${fmt(best.priceChange5d)}%`} />
+              <Stat
+                label="Stop-loss (tham khảo)"
+                value={best.stopLoss ? `${fmt(best.stopLoss)}k` : "—"}
+                color={DOWN}
+              />
+              <Stat
+                label="Mục tiêu giá (tham khảo)"
+                value={best.target1 ? `${fmt(best.target1)}k` : "—"}
+                color={ACCENT}
+              />
+              <Stat
+                label="Tỷ lệ Risk:Reward"
+                value={best.riskReward !== null ? `1:${fmt(best.riskReward, 1)}` : "—"}
+                color={best.riskReward !== null && best.riskReward >= 2 ? ACCENT : NEUTRAL}
+              />
+            </div>
+          </div>
+        )}
+
+        {ranked.length > 0 && (
+          <div className="overflow-x-auto rounded-lg border border-[#1F252E]">
+            <table className="w-full text-sm font-[var(--font-mono)]">
+              <thead>
+                <tr className="text-[#5A6270] text-xs">
+                  {["Mã", "Giá", "Điểm", "RSI", "MACD", "Phân kỳ", "Xu hướng", "ADX", "%B", "ATR%", "KL/TB20", "Ngoại%", "RS 5p", "Δ 5 phiên", "R:R"].map((h) => (
+                    <th key={h} className="text-left font-normal px-3 py-2 border-b border-[#1F252E]">
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {ranked.map((row, i) => {
+                  const div = divergenceLabel(row);
+                  return (
+                    <tr key={row.ticker + i} className="border-b border-[#161B22] last:border-0">
+                      <td className="px-3 py-2 text-[#E7EAEE] font-semibold">{row.ticker}</td>
+                      <td className="px-3 py-2 text-[#C4CBD4]">
+                        {row.lastClose ? `${fmt(row.lastClose)}k` : "—"}
+                      </td>
+                      <td className="px-3 py-2 text-[#C4CBD4]">{row.score}</td>
+                      <td className="px-3 py-2 text-[#C4CBD4]">{fmt(row.rsi14)}</td>
+                      <td className="px-3 py-2 text-[#C4CBD4]">
+                        {fmt(row.macdHistogram, 2)}
+                        {row.macdRising ? " ↑" : ""}
+                      </td>
+                      <td className="px-3 py-2" style={div.color ? { color: div.color } : undefined}>
+                        {div.text}
+                      </td>
+                      <td
+                        className="px-3 py-2"
+                        style={{
+                          color:
+                            row.trendAligned === true
+                              ? ACCENT
+                              : row.trendAligned === false
+                              ? DOWN
+                              : "#C4CBD4",
+                        }}
+                      >
+                        {row.trendAligned === null ? "—" : row.trendAligned ? "Thuận" : "Chưa thuận"}
+                      </td>
+                      <td className="px-3 py-2 text-[#C4CBD4]">
+                        {row.adx !== null ? fmt(row.adx, 0) : "—"}
+                        {row.adxBullish ? " ↑" : row.adxBullish === false ? " ↓" : ""}
+                      </td>
+                      <td className="px-3 py-2 text-[#C4CBD4]">{fmt(row.bollingerPercentB, 2)}</td>
+                      <td className="px-3 py-2 text-[#C4CBD4]">
+                        {row.atrPercent !== null ? `${fmt(row.atrPercent)}%` : "—"}
+                      </td>
+                      <td className="px-3 py-2 text-[#C4CBD4]">
+                        {row.volumeRatio ? `${fmt(row.volumeRatio, 2)}x` : "—"}
+                      </td>
+                      <td className="px-3 py-2 text-[#C4CBD4]">
+                        {row.foreignNetRatio !== null ? `${row.foreignNetRatio >= 0 ? "+" : ""}${fmt(row.foreignNetRatio)}%` : "—"}
+                      </td>
+                      <td className="px-3 py-2 text-[#C4CBD4]">
+                        {row.relativeStrength5d !== null ? `${row.relativeStrength5d >= 0 ? "+" : ""}${fmt(row.relativeStrength5d)}%` : "—"}
+                      </td>
+                      <td className="px-3 py-2 text-[#C4CBD4]">{fmt(row.priceChange5d)}%</td>
+                      <td className="px-3 py-2 text-[#C4CBD4]">
+                        {row.riskReward !== null ? `1:${fmt(row.riskReward, 1)}` : "—"}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <BacktestPanel />
+        <RegressionPanel />
+        <TrainTestPanel />
+      </section>
+
+      <footer className="border-t border-[#1F252E] px-6 py-3 text-xs text-[#5A6270] flex items-center justify-between">
+        <span>
+          {data ? `Cập nhật lúc ${new Date(data.generatedAt).toLocaleTimeString("vi-VN")}` : ""}
+        </span>
+        <span>
+          Tính trên các phiên đã đóng cửa — công cụ tham khảo, chưa qua kiểm chứng thống kê chắc chắn (xem Backtest/Hồi quy). Không phải khuyến nghị đầu tư.
+        </span>
+      </footer>
+    </main>
+  );
+}
+
+function Stat({ label, value, color }: { label: string; value: string; color?: string }) {
+  return (
+    <div className="rounded-md bg-black/20 px-3 py-2">
+      <div className="text-[10px] uppercase tracking-wide text-[#5A6270]">{label}</div>
+      <div className="font-[var(--font-mono)] text-sm mt-0.5" style={color ? { color } : undefined}>
+        {value}
+      </div>
+    </div>
+  );
+}
+
+interface BacktestBucket {
+  range: string;
+  count: number;
+  avgForwardReturnPct: number;
+  winRatePct: number;
+}
+
+interface BacktestResult {
+  ticker: string;
+  forwardDays: number;
+  sampleCount: number;
+  buckets: BacktestBucket[];
+  correlation: number | null;
+}
+
+function BacktestPanel() {
+  const [ticker, setTicker] = useState("VNM");
+  const [forwardDays, setForwardDays] = useState(5);
+  const [result, setResult] = useState<BacktestResult | null>(null);
+  const [btError, setBtError] = useState<string | null>(null);
+  const [btLoading, setBtLoading] = useState(false);
+
+  async function runBacktest() {
+    if (!ticker.trim()) return;
+    setBtLoading(true);
+    setBtError(null);
+    setResult(null);
+    try {
+      const json = await safeFetchJson(
+        `/api/backtest?ticker=${encodeURIComponent(ticker.trim())}&forwardDays=${forwardDays}`
+      );
+      setResult(json);
+    } catch (e: any) {
+      setBtError(e.message ?? "Có lỗi xảy ra");
+    } finally {
+      setBtLoading(false);
+    }
   }
 
-  return { bullish, bearish };
+  return (
+    <div className="rounded-xl border border-[#1F252E] p-5 flex flex-col gap-4">
+      <div>
+        <div className="text-xs font-semibold tracking-[0.15em] font-[var(--font-mono)] text-[#B7C0CC]">
+          BACKTEST (1 MÃ)
+        </div>
+        <p className="text-xs text-[#5A6270] mt-1 max-w-2xl">
+          Kiểm chứng: điểm số ở quá khứ có thực sự đi kèm giá tăng tốt hơn N phiên sau đó không?
+          Dùng đúng công thức chấm điểm đang chạy live, không nhìn thấy dữ liệu tương lai.
+        </p>
+      </div>
+
+      <div className="flex items-center gap-2 flex-wrap">
+        <input
+          value={ticker}
+          onChange={(e) => setTicker(e.target.value.toUpperCase())}
+          placeholder="VD: VNM"
+          className="bg-black/30 border border-[#262C36] rounded-md px-3 py-1.5 text-sm font-[var(--font-mono)] w-28 focus:outline-none focus:border-[#3A4250]"
+        />
+        <div className="flex items-center gap-1 text-xs text-[#7C8797]">
+          <span>Dự báo</span>
+          {[5, 10, 20].map((d) => (
+            <button
+              key={d}
+              onClick={() => setForwardDays(d)}
+              className="px-2 py-1 rounded border font-[var(--font-mono)] transition-colors"
+              style={{
+                borderColor: forwardDays === d ? ACCENT : "#262C36",
+                color: forwardDays === d ? ACCENT : "#7C8797",
+              }}
+            >
+              {d}p
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={runBacktest}
+          disabled={btLoading}
+          className="text-sm px-3 py-1.5 rounded-md border border-[#262C36] hover:border-[#3A4250] text-[#B7C0CC] disabled:opacity-50 transition-colors"
+        >
+          {btLoading ? "Đang chạy…" : "Chạy backtest"}
+        </button>
+      </div>
+
+      {btError && (
+        <div className="rounded-md border border-[#EA394340] bg-[#EA39430D] px-4 py-2 text-sm text-[#F2A5A9]">
+          {btError}
+        </div>
+      )}
+
+      {result && (
+        <div className="flex flex-col gap-3">
+          <div className="text-sm text-[#9AA4B2]">
+            {result.ticker} · {result.sampleCount} mốc thời gian · dự báo {result.forwardDays} phiên tới ·
+            {" "}tương quan (Pearson) giữa điểm và return:{" "}
+            <span className="font-[var(--font-mono)] font-semibold text-[#E7EAEE]">
+              {result.correlation !== null ? result.correlation.toFixed(2) : "—"}
+            </span>
+            {result.correlation !== null && (
+              <span className="text-[#5A6270]">
+                {" "}
+                ({result.correlation > 0.15
+                  ? "có tương quan dương — điểm cao thường đi kèm return tốt hơn"
+                  : result.correlation < -0.15
+                  ? "tương quan ÂM — điểm cao lại đi kèm return kém hơn, nên xem lại trọng số"
+                  : "gần như không có tương quan rõ ràng"}
+                )
+              </span>
+            )}
+          </div>
+          <div className="overflow-x-auto rounded-lg border border-[#1F252E]">
+            <table className="w-full text-sm font-[var(--font-mono)]">
+              <thead>
+                <tr className="text-[#5A6270] text-xs">
+                  {["Dải điểm", "Số mốc", "Return TB (%)", "Tỷ lệ thắng (%)"].map((h) => (
+                    <th key={h} className="text-left font-normal px-3 py-2 border-b border-[#1F252E]">
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {result.buckets.map((b) => (
+                  <tr key={b.range} className="border-b border-[#161B22] last:border-0">
+                    <td className="px-3 py-2 text-[#E7EAEE]">{b.range}</td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">{b.count}</td>
+                    <td
+                      className="px-3 py-2"
+                      style={{ color: b.avgForwardReturnPct >= 0 ? ACCENT : DOWN }}
+                    >
+                      {b.avgForwardReturnPct >= 0 ? "+" : ""}
+                      {fmt(b.avgForwardReturnPct)}%
+                    </td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">{fmt(b.winRatePct, 0)}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-xs text-[#5A6270]">
+            Backtest dựa trên dữ liệu lịch sử của riêng mã này — không đảm bảo lặp lại trong tương lai, và không phải khuyến nghị đầu tư.
+          </p>
+        </div>
+      )}
+    </div>
+  );
 }
 
-/** Các hàm chỉ báo lấy từ vnstock-js — dùng chung cho cả live scoring và backtest. */
-export interface IndicatorFns {
-  rsi: (data: any) => any[];
-  macd: (data: any) => any[];
-  sma: (data: any, opts: { period: number }) => any[];
-  bollinger: (data: any, opts: { period: number; stddev: number }) => any[];
-  atr: (data: any, period: number) => any[];
-  superTrend: (data: any) => any[];
+interface RegressionCoefficient {
+  name: string;
+  label: string;
+  coef: number;
+  standardError: number | null;
+  pValue: number | null;
+  significant: boolean;
 }
 
-/**
- * Chấm điểm momentum ngắn hạn từ 1 mảng OHLCV đã có sẵn (không tự fetch dữ
- * liệu) — tách riêng để DÙNG CHUNG cho cả live scoring (scoreShortTerm) và
- * backtest (xem src/lib/backtest.ts): backtest gọi hàm này với `history` đã
- * cắt tới từng mốc thời gian trong quá khứ, đảm bảo không có "lookahead bias"
- * (không lỡ dùng dữ liệu tương lai để chấm điểm quá khứ) vì cả 2 nơi dùng
- * đúng 1 logic.
- *
- * Đây KHÔNG phải khuyến nghị đầu tư — chỉ tổng hợp chỉ báo kỹ thuật lịch sử.
- */
-export function computeScoreFromHistory(
-  ticker: string,
-  history: OhlcvBar[],
-  vniChg5d: number | null,
-  foreignNetRatio: number | null,
-  { rsi, macd, sma, bollinger, atr, superTrend }: IndicatorFns
-): ShortTermResult | null {
-  if (!history || history.length < 55) return null;
+interface PredictedPick {
+  ticker: string;
+  lastClose: number | null;
+  predictedReturnPct: number;
+}
 
-  const rsiSeries = rsi(history);
-  const macdSeries = macd(history);
-  const sma20Series = sma(history, { period: 20 });
-  const sma50Series = sma(history, { period: 50 });
-  const bbSeries = bollinger(history, { period: 20, stddev: 2 });
-  const atrSeries = atr(history, 14);
-  const stSeries = superTrend(history);
-  const { adx, diPlus, diMinus } = computeADX(history, 14);
+interface RegressionResult {
+  tickers: string[];
+  forwardDays: number;
+  sampleCount: number;
+  r2: number;
+  coefficients: RegressionCoefficient[];
+  predictions: PredictedPick[];
+}
 
-  const lastRsi = rsiSeries?.at(-1)?.rsi ?? null;
+function RegressionPanel() {
+  const [forwardDays, setForwardDays] = useState(5);
+  const [result, setResult] = useState<RegressionResult | null>(null);
+  const [rgError, setRgError] = useState<string | null>(null);
+  const [rgLoading, setRgLoading] = useState(false);
 
-  const lastMacd = macdSeries?.at(-1)?.histogram ?? null;
-  const prevMacd = macdSeries?.at(-4)?.histogram ?? null; // so với 3 phiên trước
-  const macdHistogram = lastMacd;
-  const macdRising =
-    lastMacd !== null && prevMacd !== null ? lastMacd > prevMacd : null;
+  async function runRegression() {
+    setRgLoading(true);
+    setRgError(null);
+    setResult(null);
+    try {
+      const json = await safeFetchJson(`/api/regression?forwardDays=${forwardDays}`);
+      setResult(json);
+    } catch (e: any) {
+      setRgError(e.message ?? "Có lỗi xảy ra");
+    } finally {
+      setRgLoading(false);
+    }
+  }
 
-  const closeNow = history.at(-1)?.close ?? 0;
-  const sma20 = sma20Series?.at(-1)?.sma ?? null;
-  const sma50 = sma50Series?.at(-1)?.sma ?? null;
-  const priceVsSma20Pct = sma20 ? pctChange(sma20, closeNow) : null;
-  const trendAligned =
-    sma20 !== null && sma50 !== null ? closeNow > sma20 && sma20 > sma50 : null;
+  const nonIntercept = result?.coefficients.filter((c) => c.name !== "intercept") ?? [];
+  const sorted = [...nonIntercept].sort((a, b) => Math.abs(b.coef) - Math.abs(a.coef));
 
-  const superTrendDirection = stSeries?.at(-1)?.direction ?? null;
+  return (
+    <div className="rounded-xl border border-[#1F252E] p-5 flex flex-col gap-4">
+      <div>
+        <div className="text-xs font-semibold tracking-[0.15em] font-[var(--font-mono)] text-[#B7C0CC]">
+          HỒI QUY TRỌNG SỐ (CẢ WATCHLIST)
+        </div>
+        <p className="text-xs text-[#5A6270] mt-1 max-w-2xl">
+          Gộp dữ liệu backtest của toàn bộ watchlist, fit hồi quy tuyến tính để xem hướng chấm điểm
+          nào (RSI, MACD, khối ngoại...) thực sự được dữ liệu ủng hộ. Hệ số dương = càng cao thì return
+          càng tốt; hệ số âm = ngược lại. Đây là công cụ CHẨN ĐOÁN — không tự động áp vào công thức đang chạy live.
+        </p>
+      </div>
 
-  const bollingerPercentB = bbSeries?.at(-1)?.percentB ?? null;
+      <div className="flex items-center gap-2 flex-wrap">
+        <div className="flex items-center gap-1 text-xs text-[#7C8797]">
+          <span>Dự báo</span>
+          {[5, 10, 20].map((d) => (
+            <button
+              key={d}
+              onClick={() => setForwardDays(d)}
+              className="px-2 py-1 rounded border font-[var(--font-mono)] transition-colors"
+              style={{
+                borderColor: forwardDays === d ? NEUTRAL : "#262C36",
+                color: forwardDays === d ? NEUTRAL : "#7C8797",
+              }}
+            >
+              {d}p
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={runRegression}
+          disabled={rgLoading}
+          className="text-sm px-3 py-1.5 rounded-md border border-[#262C36] hover:border-[#3A4250] text-[#B7C0CC] disabled:opacity-50 transition-colors"
+        >
+          {rgLoading ? "Đang chạy (có thể mất 20-40s)…" : "Chạy hồi quy"}
+        </button>
+      </div>
 
-  const lastAtr = atrSeries?.at(-1)?.atr ?? null;
-  const atrPercent = lastAtr && closeNow ? (lastAtr / closeNow) * 100 : null;
+      {rgError && (
+        <div className="rounded-md border border-[#EA394340] bg-[#EA39430D] px-4 py-2 text-sm text-[#F2A5A9]">
+          {rgError}
+        </div>
+      )}
 
-  const adxBullish = diPlus !== null && diMinus !== null ? diPlus > diMinus : null;
+      {result && (
+        <div className="flex flex-col gap-3">
+          <div className="text-sm text-[#9AA4B2]">
+            {result.tickers.length} mã · {result.sampleCount} mẫu gộp · dự báo {result.forwardDays} phiên tới ·{" "}
+            R²:{" "}
+            <span className="font-[var(--font-mono)] font-semibold text-[#E7EAEE]">
+              {(result.r2 * 100).toFixed(1)}%
+            </span>
+            <span className="text-[#5A6270]">
+              {" "}
+              (% biến động return giải thích được bởi toàn bộ các biến — càng thấp càng cho thấy phần lớn biến động giá là nhiễu/ngẫu nhiên, không nằm trong các chỉ báo này)
+            </span>
+          </div>
+          <div className="overflow-x-auto rounded-lg border border-[#1F252E]">
+            <table className="w-full text-sm font-[var(--font-mono)]">
+              <thead>
+                <tr className="text-[#5A6270] text-xs">
+                  {["Biến số", "Hệ số", "p-value", "Đọc hiểu"].map((h) => (
+                    <th key={h} className="text-left font-normal px-3 py-2 border-b border-[#1F252E]">
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.map((c) => (
+                  <tr key={c.name} className="border-b border-[#161B22] last:border-0">
+                    <td className="px-3 py-2 text-[#E7EAEE]">{c.label}</td>
+                    <td className="px-3 py-2" style={{ color: c.coef >= 0 ? ACCENT : DOWN }}>
+                      {c.coef >= 0 ? "+" : ""}
+                      {c.coef.toFixed(3)}
+                    </td>
+                    <td className="px-3 py-2" style={{ color: c.significant ? "#E7EAEE" : "#5A6270" }}>
+                      {c.pValue !== null ? c.pValue.toFixed(3) : "—"}
+                    </td>
+                    <td className="px-3 py-2 text-[#7C8797]">
+                      {!c.significant
+                        ? "chưa đủ ý nghĩa thống kê (p ≥ 0.05) — có thể chỉ là nhiễu"
+                        : c.coef > 0
+                        ? "có ý nghĩa thống kê — hướng chấm điểm hiện tại (cộng điểm) có cơ sở"
+                        : "có ý nghĩa thống kê nhưng NGƯỢC hướng đang chấm điểm — nên xem lại dấu +/- hiện tại"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-xs text-[#5A6270]">
+            Fit trên ~{result.sampleCount} mẫu gộp từ {result.tickers.length} mã — đủ để chẩn đoán xu hướng chung,
+            nhưng không đủ để khẳng định chắc chắn cho từng mã riêng lẻ. p-value ước tính theo phân phối chuẩn
+            (số mẫu đủ lớn nên xấp xỉ này đáng tin). Không phải khuyến nghị đầu tư.
+          </p>
 
-  const recent20 = history.slice(-20);
-  const avgVol20 = recent20.reduce((sum, r) => sum + r.volume, 0) / recent20.length;
-  const lastVol = history.at(-1)?.volume ?? 0;
-  const volumeRatio = avgVol20 > 0 ? lastVol / avgVol20 : null;
+          {result.predictions.length > 0 && (
+            <div className="flex flex-col gap-2 mt-2">
+              <div className="text-xs font-semibold tracking-[0.15em] font-[var(--font-mono)] text-[#B7C0CC]">
+                DỰ ĐOÁN THEO MÔ HÌNH (THỬ NGHIỆM)
+              </div>
+              <p className="text-xs text-[#5A6270] max-w-2xl">
+                Áp hệ số vừa fit vào dữ liệu mới nhất của từng mã để ước tính return kỳ vọng {result.forwardDays} phiên tới.
+                Đây là mô hình fit TRONG-MẪU (in-sample) — chưa kiểm chứng trên dữ liệu ngoài mẫu, và R² ở trên cho thấy
+                độ tin cậy tổng thể vẫn thấp. Xem như một cách xếp hạng khác để tham khảo, không phải dự báo chắc chắn.
+              </p>
+              <div className="overflow-x-auto rounded-lg border border-[#1F252E]">
+                <table className="w-full text-sm font-[var(--font-mono)]">
+                  <thead>
+                    <tr className="text-[#5A6270] text-xs">
+                      {["Mã", "Giá", "Return kỳ vọng"].map((h) => (
+                        <th key={h} className="text-left font-normal px-3 py-2 border-b border-[#1F252E]">
+                          {h}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {result.predictions.slice(0, 10).map((p) => (
+                      <tr key={p.ticker} className="border-b border-[#161B22] last:border-0">
+                        <td className="px-3 py-2 text-[#E7EAEE] font-semibold">{p.ticker}</td>
+                        <td className="px-3 py-2 text-[#C4CBD4]">
+                          {p.lastClose ? `${fmt(p.lastClose)}k` : "—"}
+                        </td>
+                        <td
+                          className="px-3 py-2"
+                          style={{ color: p.predictedReturnPct >= 0 ? ACCENT : DOWN }}
+                        >
+                          {p.predictedReturnPct >= 0 ? "+" : ""}
+                          {fmt(p.predictedReturnPct)}%
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
-  const close5dAgo = history.at(-6)?.close ?? closeNow;
-  const priceChange5d = pctChange(close5dAgo, closeNow);
+interface TrainTestBucket {
+  label: string;
+  count: number;
+  avgActualReturnPct: number;
+  winRatePct: number;
+}
 
-  const relativeStrength5d = vniChg5d !== null ? priceChange5d - vniChg5d : null;
+interface TrainTestResult {
+  tickers: string[];
+  forwardDays: number;
+  trainCount: number;
+  testCount: number;
+  trainDateRange: [string, string];
+  testDateRange: [string, string];
+  trainR2: number;
+  oosR2: number;
+  oosCorrelation: number | null;
+  buckets: TrainTestBucket[];
+}
 
-  // Phân kỳ RSI & MACD qua pivot points — tín hiệu đảo chiều sớm
-  const closeArr = history.map((r) => r.close);
-  const rsiArr = rsiSeries.map((r: any) => r.rsi ?? NaN);
-  const macdHistArr = macdSeries.map((r: any) => r.histogram ?? NaN);
-  const rsiDiv = detectDivergence(closeArr, rsiArr, 5, 60);
-  const macdDiv = detectDivergence(closeArr, macdHistArr, 5, 60);
+function TrainTestPanel() {
+  const [forwardDays, setForwardDays] = useState(5);
+  const [result, setResult] = useState<TrainTestResult | null>(null);
+  const [ttError, setTtError] = useState<string | null>(null);
+  const [ttLoading, setTtLoading] = useState(false);
 
-  // Hỗ trợ/kháng cự 20 phiên — dùng làm cơ sở đặt stop-loss & mục tiêu giá
-  const support20 = Math.min(...recent20.map((r) => r.low));
-  const resistance20 = Math.max(...recent20.map((r) => r.high));
-  const stopLoss = support20 > 0 ? support20 * 0.99 : null;
-  const target1 =
-    lastAtr !== null ? Math.max(resistance20, closeNow + 2 * lastAtr) : resistance20 || null;
-  const riskReward =
-    stopLoss !== null && target1 !== null && closeNow - stopLoss > 0
-      ? (target1 - closeNow) / (closeNow - stopLoss)
+  async function runTrainTest() {
+    setTtLoading(true);
+    setTtError(null);
+    setResult(null);
+    try {
+      const json = await safeFetchJson(`/api/train-test?forwardDays=${forwardDays}`);
+      setResult(json);
+    } catch (e: any) {
+      setTtError(e.message ?? "Có lỗi xảy ra");
+    } finally {
+      setTtLoading(false);
+    }
+  }
+
+  const q1 = result?.buckets[0];
+  const q4 = result?.buckets.at(-1);
+  const monotonic =
+    result && result.buckets.length >= 2
+      ? result.buckets.every(
+          (b, i) => i === 0 || b.avgActualReturnPct >= result.buckets[i - 1].avgActualReturnPct - 0.5
+        )
       : null;
 
-  // --- Chấm điểm 0-100, cộng dồn theo từng dải giá trị cụ thể ---
-  let score = 50;
-  const reasons: string[] = [];
+  return (
+    <div className="rounded-xl border border-[#1F252E] p-5 flex flex-col gap-4">
+      <div>
+        <div className="text-xs font-semibold tracking-[0.15em] font-[var(--font-mono)] text-[#B7C0CC]">
+          KIỂM CHỨNG TRAIN/TEST (NGHIÊM NGẶT NHẤT)
+        </div>
+        <p className="text-xs text-[#5A6270] mt-1 max-w-2xl">
+          Fit hệ số chỉ trên 70% dữ liệu CŨ HƠN (theo thời gian), rồi kiểm tra trên 30% dữ liệu MỚI HƠN
+          mà mô hình chưa từng thấy. Nếu mô hình thực sự có giá trị, nhóm được dự đoán return cao (Q4)
+          phải có return thực tế cao hơn rõ rệt so với nhóm dự đoán thấp (Q1) — kể cả trên dữ liệu chưa thấy.
+        </p>
+      </div>
 
-  // 1) Cấu trúc xu hướng: SMA20/50 + SuperTrend + ADX
-  if (trendAligned === true) {
-    score += 15;
-    reasons.push("Giá > SMA20 > SMA50 (xu hướng tăng rõ ràng)");
-  } else if (trendAligned === false) {
-    score -= 15;
-    reasons.push("Cấu trúc SMA cho thấy xu hướng chưa thuận lợi");
-  }
-  if (superTrendDirection === "bullish") {
-    score += 10;
-    reasons.push("SuperTrend xác nhận xu hướng tăng");
-  } else if (superTrendDirection === "bearish") {
-    score -= 10;
-    reasons.push("SuperTrend đang ở chiều giảm");
-  }
-  if (adx !== null && adxBullish !== null) {
-    if (adx > 25 && adxBullish) {
-      score += 10;
-      reasons.push(`ADX ${adx.toFixed(0)} xác nhận xu hướng tăng mạnh, không phải nhiễu`);
-    } else if (adx > 25 && !adxBullish) {
-      score -= 10;
-      reasons.push(`ADX ${adx.toFixed(0)} cho thấy phe bán đang mạnh`);
-    } else if (adx < 20) {
-      score -= 3;
-      reasons.push(`ADX ${adx.toFixed(0)} thấp — thị trường đang đi ngang, tín hiệu kém tin cậy`);
-    }
-  }
+      <div className="flex items-center gap-2 flex-wrap">
+        <div className="flex items-center gap-1 text-xs text-[#7C8797]">
+          <span>Dự báo</span>
+          {[5, 10, 20].map((d) => (
+            <button
+              key={d}
+              onClick={() => setForwardDays(d)}
+              className="px-2 py-1 rounded border font-[var(--font-mono)] transition-colors"
+              style={{
+                borderColor: forwardDays === d ? NEUTRAL : "#262C36",
+                color: forwardDays === d ? NEUTRAL : "#7C8797",
+              }}
+            >
+              {d}p
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={runTrainTest}
+          disabled={ttLoading}
+          className="text-sm px-3 py-1.5 rounded-md border border-[#262C36] hover:border-[#3A4250] text-[#B7C0CC] disabled:opacity-50 transition-colors"
+        >
+          {ttLoading ? "Đang chạy (có thể mất 20-40s)…" : "Chạy kiểm chứng"}
+        </button>
+      </div>
 
-  // 2) RSI — vùng động lượng khỏe mà chưa quá mua
-  if (lastRsi !== null) {
-    if (lastRsi >= 50 && lastRsi <= 65) {
-      score += 15;
-      reasons.push(`RSI ${lastRsi.toFixed(1)} trong vùng động lượng khỏe`);
-    } else if (lastRsi > 65 && lastRsi <= 72) {
-      score += 6;
-      reasons.push(`RSI ${lastRsi.toFixed(1)} mạnh nhưng gần vùng quá mua`);
-    } else if (lastRsi > 72) {
-      score -= 8;
-      reasons.push(`RSI ${lastRsi.toFixed(1)} quá mua, rủi ro điều chỉnh`);
-    } else if (lastRsi >= 40) {
-      score += 3;
-    } else {
-      score -= 10;
-      reasons.push(`RSI ${lastRsi.toFixed(1)} yếu`);
-    }
-  }
+      {ttError && (
+        <div className="rounded-md border border-[#EA394340] bg-[#EA39430D] px-4 py-2 text-sm text-[#F2A5A9]">
+          {ttError}
+        </div>
+      )}
 
-  // 3) MACD — động lượng có đang tăng tốc không, không chỉ dương/âm
-  if (macdHistogram !== null) {
-    if (macdHistogram > 0 && macdRising) {
-      score += 15;
-      reasons.push("MACD dương và đang tăng tốc");
-    } else if (macdHistogram > 0) {
-      score += 7;
-      reasons.push("MACD dương nhưng động lượng chững lại");
-    } else {
-      score -= 10;
-      reasons.push("MACD âm, động lượng yếu");
-    }
-  }
+      {result && (
+        <div className="flex flex-col gap-3">
+          <div className="text-sm text-[#9AA4B2]">
+            Train: {result.trainCount} mẫu ({result.trainDateRange[0]} → {result.trainDateRange[1]}) · Test:{" "}
+            {result.testCount} mẫu ({result.testDateRange[0]} → {result.testDateRange[1]})
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+            <Stat label="R² trên tập train" value={`${(result.trainR2 * 100).toFixed(1)}%`} />
+            <Stat
+              label="R² ngoài mẫu (test)"
+              value={`${(result.oosR2 * 100).toFixed(1)}%`}
+              color={result.oosR2 > 0 ? ACCENT : DOWN}
+            />
+            <Stat
+              label="Tương quan ngoài mẫu"
+              value={result.oosCorrelation !== null ? result.oosCorrelation.toFixed(2) : "—"}
+              color={
+                result.oosCorrelation !== null
+                  ? result.oosCorrelation > 0.1
+                    ? ACCENT
+                    : result.oosCorrelation < -0.1
+                    ? DOWN
+                    : NEUTRAL
+                  : undefined
+              }
+            />
+          </div>
 
-  // 4) Phân kỳ RSI/MACD — tín hiệu đảo chiều sớm, độc lập với mức giá trị hiện tại
-  if (rsiDiv.bullish) {
-    score += 8;
-    reasons.push("Phân kỳ tăng trên RSI — tín hiệu đảo chiều sớm");
-  }
-  if (rsiDiv.bearish) {
-    score -= 8;
-    reasons.push("Phân kỳ giảm trên RSI — cảnh báo đảo chiều");
-  }
-  if (macdDiv.bullish) {
-    score += 8;
-    reasons.push("Phân kỳ tăng trên MACD");
-  }
-  if (macdDiv.bearish) {
-    score -= 8;
-    reasons.push("Phân kỳ giảm trên MACD");
-  }
+          {result.oosR2 < 0 && (
+            <div className="rounded-md border border-[#EA394340] bg-[#EA39430D] px-4 py-2 text-xs text-[#F2A5A9]">
+              R² ngoài mẫu ÂM nghĩa là mô hình dự đoán TỆ HƠN cả việc chỉ đoán bằng giá trị trung bình —
+              dấu hiệu rõ ràng của overfitting: mô hình học "thuộc lòng" dữ liệu train, không khái quát hoá được.
+            </div>
+          )}
 
-  // 5) Bollinger %B — vị trí trong dải, tránh mua đuổi khi đã quá dải trên
-  if (bollingerPercentB !== null) {
-    if (bollingerPercentB > 1.0) {
-      score -= 8;
-      reasons.push("Giá vượt dải trên Bollinger, có thể đã quá đà");
-    } else if (bollingerPercentB >= 0.5) {
-      score += 10;
-      reasons.push("Giá ở nửa trên dải Bollinger, còn dư địa tăng");
-    } else if (bollingerPercentB >= 0.2) {
-      score += 2;
-    } else {
-      score -= 8;
-      reasons.push("Giá gần dải dưới Bollinger, xu hướng yếu");
-    }
-  }
+          <div className="overflow-x-auto rounded-lg border border-[#1F252E]">
+            <table className="w-full text-sm font-[var(--font-mono)]">
+              <thead>
+                <tr className="text-[#5A6270] text-xs">
+                  {["Nhóm (theo dự đoán)", "Số mẫu", "Return thực tế TB", "Tỷ lệ thắng"].map((h) => (
+                    <th key={h} className="text-left font-normal px-3 py-2 border-b border-[#1F252E]">
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {result.buckets.map((b) => (
+                  <tr key={b.label} className="border-b border-[#161B22] last:border-0">
+                    <td className="px-3 py-2 text-[#E7EAEE]">{b.label}</td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">{b.count}</td>
+                    <td
+                      className="px-3 py-2"
+                      style={{ color: b.avgActualReturnPct >= 0 ? ACCENT : DOWN }}
+                    >
+                      {b.avgActualReturnPct >= 0 ? "+" : ""}
+                      {fmt(b.avgActualReturnPct)}%
+                    </td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">{fmt(b.winRatePct, 0)}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
 
-  // 6) Khối lượng xác nhận
-  if (volumeRatio !== null) {
-    if (volumeRatio > 1.5) {
-      score += 15;
-      reasons.push(`Khối lượng gấp ${volumeRatio.toFixed(1)}x TB 20 phiên`);
-    } else if (volumeRatio > 1.2) {
-      score += 8;
-      reasons.push(`Khối lượng cao hơn ${((volumeRatio - 1) * 100).toFixed(0)}% TB 20 phiên`);
-    } else if (volumeRatio < 0.8) {
-      score -= 5;
-    }
-  }
+          {q1 && q4 && (
+            <p className="text-xs" style={{ color: monotonic ? ACCENT : "#7C8797" }}>
+              {monotonic
+                ? `Q4 (dự đoán cao nhất) có return thực tế ${fmt(q4.avgActualReturnPct)}% so với Q1 (dự đoán thấp nhất) ${fmt(q1.avgActualReturnPct)}% — nhóm dự đoán cao hơn thực sự cho kết quả tốt hơn trên dữ liệu chưa thấy.`
+                : "Thứ tự các nhóm KHÔNG đơn điệu tăng dần — mô hình chưa cho thấy khả năng phân biệt đáng tin trên dữ liệu ngoài mẫu."}
+            </p>
+          )}
 
-  // 7) Khối ngoại mua/bán ròng — nguồn thông tin độc lập với giá/KL nội bộ
-  if (foreignNetRatio !== null) {
-    if (foreignNetRatio > 10) {
-      score += 10;
-      reasons.push(`Khối ngoại mua ròng mạnh (${foreignNetRatio.toFixed(1)}% tổng KL)`);
-    } else if (foreignNetRatio > 3) {
-      score += 5;
-      reasons.push(`Khối ngoại mua ròng (${foreignNetRatio.toFixed(1)}% tổng KL)`);
-    } else if (foreignNetRatio < -10) {
-      score -= 10;
-      reasons.push(`Khối ngoại bán ròng mạnh (${foreignNetRatio.toFixed(1)}% tổng KL)`);
-    } else if (foreignNetRatio < -3) {
-      score -= 5;
-      reasons.push(`Khối ngoại bán ròng (${foreignNetRatio.toFixed(1)}% tổng KL)`);
-    }
-  }
-
-  // 8) Sức mạnh tương đối so với VNINDEX — mã có đang dẫn dắt thị trường không
-  if (relativeStrength5d !== null) {
-    if (relativeStrength5d > 3) {
-      score += 8;
-      reasons.push(`Mạnh hơn VNINDEX ${relativeStrength5d.toFixed(1)}% trong 5 phiên — đang dẫn dắt`);
-    } else if (relativeStrength5d > 1) {
-      score += 4;
-    } else if (relativeStrength5d < -3) {
-      score -= 8;
-      reasons.push(`Yếu hơn VNINDEX ${Math.abs(relativeStrength5d).toFixed(1)}% trong 5 phiên`);
-    } else if (relativeStrength5d < -1) {
-      score -= 4;
-    }
-  }
-
-  // 9) Biến động giá 5 phiên — tăng khỏe nhưng chưa quá "đuổi giá"
-  if (priceChange5d > 2 && priceChange5d <= 8) {
-    score += 10;
-    reasons.push(`Giá tăng ${priceChange5d.toFixed(1)}% trong 5 phiên, nhịp tăng khỏe`);
-  } else if (priceChange5d > 8 && priceChange5d <= 15) {
-    score += 4;
-    reasons.push(`Giá tăng ${priceChange5d.toFixed(1)}%, bắt đầu hơi nóng`);
-  } else if (priceChange5d > 15) {
-    score -= 5;
-    reasons.push(`Giá tăng nóng ${priceChange5d.toFixed(1)}% trong 5 phiên, rủi ro đuổi giá`);
-  } else if (priceChange5d >= 0) {
-    score += 3;
-  } else {
-    score -= 5;
-  }
-
-  // 10) Rủi ro biến động — ATR quá cao so với giá làm việc canh điểm vào/ra khó hơn
-  if (atrPercent !== null && atrPercent > 5) {
-    score -= 3;
-    reasons.push(`ATR ${atrPercent.toFixed(1)}% giá — biến động cao, cần quản trị rủi ro chặt`);
-  }
-
-  return {
-    ticker,
-    score: Math.round(Math.max(0, Math.min(100, score))),
-    lastClose: closeNow,
-    rsi14: lastRsi,
-    macdHistogram,
-    macdRising,
-    sma20,
-    sma50,
-    priceVsSma20Pct,
-    trendAligned,
-    superTrend: superTrendDirection,
-    bollingerPercentB,
-    atrPercent,
-    adx,
-    adxBullish,
-    volumeRatio,
-    priceChange5d,
-    foreignNetRatio,
-    relativeStrength5d,
-    rsiBullDiv: rsiDiv.bullish,
-    rsiBearDiv: rsiDiv.bearish,
-    macdBullDiv: macdDiv.bullish,
-    macdBearDiv: macdDiv.bearish,
-    stopLoss,
-    target1,
-    riskReward,
-    reason: reasons.join("; ") || "Không đủ dữ liệu để đánh giá",
-  };
-}
-
-/**
- * Market breadth: lấy xu hướng VNINDEX để điều chỉnh điểm toàn watchlist, và
- * trả về chg5d để dùng tính "sức mạnh tương đối" cho từng mã.
- * Nếu lấy dữ liệu VNINDEX thất bại, trả về null và bỏ qua các bước phụ thuộc
- * (không chặn toàn bộ kết quả vì 1 phần phụ này lỗi).
- */
-async function fetchMarketBreadth(): Promise<MarketBreadth | null> {
-  try {
-    const { stock } = await getVnstock();
-    const start = new Date();
-    start.setDate(start.getDate() - 20);
-
-    let vni = await stock.quote({
-      ticker: "VNINDEX",
-      start: start.toISOString().slice(0, 10),
-    });
-    vni = trimUnclosedBar(vni);
-    if (!vni || vni.length < 6) return null;
-
-    const last = vni.at(-1)!.close;
-    const prev = vni.at(-2)!.close;
-    const prev5 = vni.at(-6)!.close;
-    const chg1d = pctChange(prev, last);
-    const chg5d = pctChange(prev5, last);
-
-    let adjustment = 0;
-    if (chg1d < -1.5) adjustment = -8;
-    else if (chg1d < -0.5) adjustment = -4;
-    else if (chg1d > 1.5) adjustment = 5;
-    else if (chg1d > 0.5) adjustment = 3;
-
-    const trend: MarketBreadth["trend"] =
-      chg1d > 0.5 ? "bull" : chg1d < -0.5 ? "bear" : "neutral";
-
-    return { trend, chg1d, chg5d, adjustment };
-  } catch (err) {
-    console.error("fetchMarketBreadth failed:", err);
-    return null;
-  }
-}
-
-/**
- * Khối ngoại mua/bán ròng cho cả watchlist trong 1 lần gọi — nguồn dữ liệu
- * ĐỘC LẬP với giá/khối lượng nội bộ (không suy ra được từ các chỉ báo kỹ
- * thuật khác), nên bổ sung thông tin thực sự mới cho scoring.
- */
-async function fetchForeignFlow(universe: string[]): Promise<Map<string, number>> {
-  const map = new Map<string, number>();
-  try {
-    const { Vnstock } = await getVnstock();
-    const board = await new Vnstock().stock.trading.priceBoard(universe);
-    for (const row of board as Record<string, any>[]) {
-      const buy = row.foreignBuyVolume ?? 0;
-      const sell = row.foreignSellVolume ?? 0;
-      const total = row.totalVolume ?? row.matchVolume ?? 0;
-      if (total > 0) {
-        map.set(String(row.symbol).toUpperCase(), ((buy - sell) / total) * 100);
-      }
-    }
-  } catch (err) {
-    console.error("fetchForeignFlow failed:", err);
-  }
-  return map;
-}
-
-/** Wrapper: lấy dữ liệu mới nhất cho 1 mã rồi chấm điểm bằng computeScoreFromHistory. */
-async function scoreShortTerm(
-  ticker: string,
-  vniChg5d: number | null,
-  foreignNetRatio: number | null
-): Promise<ShortTermResult | null> {
-  try {
-    const fns = await getVnstock();
-    const start = new Date();
-    start.setDate(start.getDate() - 150); // ~5 tháng để SMA50/ATR/divergence đủ dữ liệu ổn định
-
-    let history = await fns.stock.quote({
-      ticker,
-      start: start.toISOString().slice(0, 10),
-    });
-
-    if (!history || history.length < 55) return null;
-
-    // Trong giờ giao dịch, nến "hôm nay" vẫn đang hình thành (giá đóng cửa tạm
-    // thời cập nhật liên tục) — dùng nó để tính RSI/MACD/SMA/Bollinger sẽ khiến
-    // điểm số nhảy loạn suốt phiên. Bỏ nến này đi, chỉ tính trên các phiên đã
-    // đóng cửa thực sự; điểm số sẽ chỉ đổi 1 lần/ngày, sau khi thị trường đóng cửa.
-    history = trimUnclosedBar(history);
-
-    return computeScoreFromHistory(ticker, history, vniChg5d, foreignNetRatio, fns);
-  } catch (err) {
-    console.error(`scoreShortTerm failed for ${ticker}:`, err);
-    return null;
-  }
-}
-
-export async function runAnalysis(universe: string[] = DEFAULT_UNIVERSE) {
-  const t0 = Date.now();
-  const { init } = await getVnstock();
-  // os.homedir() không ghi được trên Vercel serverless — chỉ /tmp là ghi được.
-  await init({ cacheDir: path.join(os.tmpdir(), "vnstock-js-cache") });
-
-  // Lấy VNINDEX + khối ngoại trước (cần cho mọi mã), rồi mới chấm điểm song song từng mã
-  const [marketBreadth, foreignFlow] = await Promise.all([
-    fetchMarketBreadth(),
-    fetchForeignFlow(universe),
-  ]);
-  console.log(`[runAnalysis] xong market breadth + khối ngoại sau ${Date.now() - t0}ms`);
-
-  // Chia nhỏ theo từng đợt thay vì gọi tất cả cùng lúc — nếu nguồn dữ liệu
-  // giới hạn số request đồng thời từ cùng 1 IP, gọi hết 20 mã song song có
-  // thể khiến chúng bị xếp hàng phía server và cộng dồn thời gian, dễ vượt
-  // giới hạn 60s của serverless function.
-  const BATCH_SIZE = 6;
-  const shortTermSettled: (ShortTermResult | null)[] = [];
-  for (let i = 0; i < universe.length; i += BATCH_SIZE) {
-    const batch = universe.slice(i, i + BATCH_SIZE);
-    const batchResults = await Promise.all(
-      batch.map((t) => scoreShortTerm(t, marketBreadth?.chg5d ?? null, foreignFlow.get(t) ?? null))
-    );
-    shortTermSettled.push(...batchResults);
-    console.log(
-      `[runAnalysis] xong đợt ${Math.floor(i / BATCH_SIZE) + 1} (${batch.join(",")}) sau ${Date.now() - t0}ms tổng`
-    );
-  }
-
-  let shortTermRanked = shortTermSettled.filter(
-    (r): r is ShortTermResult => r !== null
+          <p className="text-xs text-[#5A6270]">
+            Đây là bài kiểm tra nghiêm ngặt nhất trong app: mô hình hoàn toàn KHÔNG thấy dữ liệu test khi
+            fit. Nếu R² ngoài mẫu gần 0 hoặc âm, kết luận hợp lý là bộ chỉ báo hiện tại không đủ sức dự
+            đoán return ngắn hạn cho nhóm cổ phiếu này — đó là một kết luận khoa học hợp lệ, không phải
+            thất bại của việc xây dựng hệ thống. Không phải khuyến nghị đầu tư.
+          </p>
+        </div>
+      )}
+    </div>
   );
-
-  // Áp điều chỉnh market breadth cho toàn bộ watchlist rồi xếp hạng lại
-  if (marketBreadth && marketBreadth.adjustment !== 0) {
-    shortTermRanked = shortTermRanked.map((r) => ({
-      ...r,
-      score: Math.round(Math.max(0, Math.min(100, r.score + marketBreadth.adjustment))),
-    }));
-  }
-  shortTermRanked = shortTermRanked.sort((a, b) => b.score - a.score);
-
-  console.log(`[runAnalysis] hoàn tất sau ${Date.now() - t0}ms tổng, ${shortTermRanked.length}/${universe.length} mã thành công`);
-
-  return {
-    generatedAt: new Date().toISOString(),
-    marketBreadth,
-    shortTerm: {
-      best: shortTermRanked[0] ?? null,
-      ranked: shortTermRanked.slice(0, 15),
-    },
-  };
 }
