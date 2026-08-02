@@ -1,706 +1,449 @@
-import os from "os";
-import path from "path";
 import { getVnstock } from "./vnstock-client";
+import { computeScoreFromHistory, pctChange, trimUnclosedBar, withRetry, ShortTermResult } from "./analyze";
 
-// Rổ mã mặc định để quét — có thể mở rộng sau (VN30 tiêu biểu, thanh khoản tốt)
-export const DEFAULT_UNIVERSE = [
-  "VCB", "MBB", "TCB", "CTG", "BID", "ACB", "VPB", "STB",
-  "FPT", "HPG", "VIC", "VHM", "VNM", "MSN", "MWG", "PNJ",
-  "GAS", "POW", "SSI", "VRE",
+export interface RegressionCoefficient {
+  name: string;
+  label: string;
+  coef: number;
+  standardError: number | null;
+  pValue: number | null;
+  significant: boolean; // p < 0.05
+}
+
+export interface PredictedPick {
+  ticker: string;
+  lastClose: number | null;
+  predictedReturnPct: number;
+}
+
+export interface RegressionResult {
+  tickers: string[];
+  forwardDays: number;
+  sampleCount: number;
+  r2: number;
+  coefficients: RegressionCoefficient[];
+  predictions: PredictedPick[];
+}
+
+export interface TrainTestBucket {
+  label: string;
+  count: number;
+  avgActualReturnPct: number;
+  winRatePct: number;
+}
+
+export interface TrainTestResult {
+  tickers: string[];
+  forwardDays: number;
+  trainCount: number;
+  testCount: number;
+  trainDateRange: [string, string];
+  testDateRange: [string, string];
+  trainR2: number;
+  oosR2: number;
+  oosCorrelation: number | null;
+  buckets: TrainTestBucket[];
+}
+
+/**
+ * Mỗi feature ứng với 1 "quy tắc" đang dùng trong computeScoreFromHistory
+ * (analyze.ts), viết lại dưới dạng biến số liên tục thay vì các dải rời rạc,
+ * để hồi quy có đủ bậc tự do so với số mẫu thu thập được. Dấu (+/-) và độ lớn
+ * của hệ số sau khi fit cho biết hướng chấm điểm hiện tại có được dữ liệu thực
+ * tế ủng hộ hay không — KHÔNG dùng để tự động ghi đè công thức đang chạy live.
+ */
+const FEATURES: { name: string; label: string; extract: (r: ShortTermResult) => number }[] = [
+  { name: "intercept", label: "Hằng số", extract: () => 1 },
+  {
+    name: "trend",
+    label: "Xu hướng SMA (Thuận=+1 / Chưa thuận=-1)",
+    extract: (r) => (r.trendAligned === true ? 1 : r.trendAligned === false ? -1 : 0),
+  },
+  {
+    name: "superTrend",
+    label: "SuperTrend (Tăng=+1 / Giảm=-1)",
+    extract: (r) => (r.superTrend === "bullish" ? 1 : r.superTrend === "bearish" ? -1 : 0),
+  },
+  {
+    name: "adxDirStrength",
+    label: "ADX × chiều (độ mạnh xu hướng có dấu, /100)",
+    extract: (r) => {
+      const dir = r.adxBullish === true ? 1 : r.adxBullish === false ? -1 : 0;
+      return ((r.adx ?? 0) * dir) / 100;
+    },
+  },
+  { name: "rsiCentered", label: "RSI − 50", extract: (r) => (r.rsi14 ?? 50) - 50 },
+  {
+    name: "macdPct",
+    label: "MACD histogram (% giá đóng cửa)",
+    extract: (r) =>
+      r.lastClose && r.macdHistogram !== null ? (r.macdHistogram / r.lastClose) * 100 : 0,
+  },
+  {
+    name: "macdRising",
+    label: "MACD đang tăng tốc (+1) / chững lại (-1)",
+    extract: (r) => (r.macdRising === true ? 1 : r.macdRising === false ? -1 : 0),
+  },
+  {
+    name: "divergence",
+    label: "Phân kỳ (tăng=+1 / giảm=-1)",
+    extract: (r) =>
+      (r.rsiBullDiv || r.macdBullDiv ? 1 : 0) - (r.rsiBearDiv || r.macdBearDiv ? 1 : 0),
+  },
+  { name: "bollinger", label: "Bollinger %B", extract: (r) => r.bollingerPercentB ?? 0.5 },
+  { name: "volumeRatio", label: "Khối lượng / TB 20 phiên", extract: (r) => r.volumeRatio ?? 1 },
+  {
+    name: "relativeStrength5d",
+    label: "Sức mạnh tương đối vs VNINDEX 5 phiên (%)",
+    extract: (r) => r.relativeStrength5d ?? 0,
+  },
+  { name: "priceChange5d", label: "Δ giá 5 phiên (%)", extract: (r) => r.priceChange5d ?? 0 },
+  { name: "atrPercent", label: "ATR (% giá)", extract: (r) => r.atrPercent ?? 0 },
 ];
 
-export interface MarketBreadth {
-  trend: "bull" | "bear" | "neutral";
-  chg1d: number;
-  chg5d: number;
-  adjustment: number; // điểm cộng/trừ áp cho toàn bộ watchlist
+/** Nghịch đảo ma trận vuông bằng khử Gauss-Jordan (augment với ma trận đơn vị). */
+function invertMatrix(A: number[][]): number[][] | null {
+  const n = A.length;
+  const M = A.map((row, i) => [...row, ...Array.from({ length: n }, (_, j) => (i === j ? 1 : 0))]);
+
+  for (let col = 0; col < n; col++) {
+    let pivotRow = col;
+    for (let r = col + 1; r < n; r++) {
+      if (Math.abs(M[r][col]) > Math.abs(M[pivotRow][col])) pivotRow = r;
+    }
+    [M[col], M[pivotRow]] = [M[pivotRow], M[col]];
+    if (Math.abs(M[col][col]) < 1e-9) return null; // ma trận suy biến (đa cộng tuyến quá nặng)
+
+    const pivot = M[col][col];
+    for (let c = 0; c < 2 * n; c++) M[col][c] /= pivot;
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const factor = M[r][col];
+      for (let c = 0; c < 2 * n; c++) M[r][c] -= factor * M[col][c];
+    }
+  }
+  return M.map((row) => row.slice(n));
 }
 
-export interface OhlcvBar {
-  date: string | Date;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
+/** Xấp xỉ hàm erf (Abramowitz-Stegun) để tính phân phối chuẩn tắc. */
+function erf(z: number): number {
+  const t = 1 / (1 + 0.3275911 * Math.abs(z));
+  const y =
+    1 -
+    (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) *
+      t *
+      Math.exp(-z * z);
+  return z >= 0 ? y : -y;
 }
 
-export interface ShortTermResult {
-  ticker: string;
-  score: number;
-  lastClose: number | null;
-  rsi14: number | null;
-  macdHistogram: number | null;
-  macdRising: boolean | null; // histogram đang tăng dần (động lượng tăng tốc)
-  sma20: number | null;
-  sma50: number | null;
-  priceVsSma20Pct: number | null; // giá lệch SMA20 bao nhiêu %
-  trendAligned: boolean | null; // giá > SMA20 > SMA50 (xu hướng tăng rõ ràng)
-  superTrend: "bullish" | "bearish" | null;
-  bollingerPercentB: number | null; // vị trí trong dải Bollinger (0=dải dưới, 1=dải trên)
-  atrPercent: number | null; // ATR / giá — đo biến động tương đối (rủi ro)
-  adx: number | null; // độ mạnh xu hướng (ADX > 25: mạnh, < 20: yếu/đi ngang)
-  adxBullish: boolean | null; // DI+ > DI- (phe mua đang thắng thế)
-  volumeRatio: number | null; // volume gần nhất / TB 20 phiên
-  priceChange5d: number | null; // % thay đổi giá 5 phiên gần nhất
-  foreignNetRatio: number | null; // (mua ròng - bán ròng khối ngoại) / tổng KL, %
-  relativeStrength5d: number | null; // % tăng giá 5 phiên của mã trừ % của VNINDEX
-  rsiBullDiv: boolean; // phân kỳ tăng trên RSI (đảo chiều sớm)
-  rsiBearDiv: boolean; // phân kỳ giảm trên RSI
-  macdBullDiv: boolean; // phân kỳ tăng trên MACD histogram
-  macdBearDiv: boolean; // phân kỳ giảm trên MACD histogram
-  stopLoss: number | null;
-  target1: number | null;
-  riskReward: number | null; // (target1 - giá) / (giá - stopLoss)
-  reason: string;
+function normalCdf(z: number): number {
+  return 0.5 * (1 + erf(z / Math.SQRT2));
 }
 
-export function pctChange(from: number, to: number): number {
-  if (!from) return 0;
-  return ((to - from) / from) * 100;
+/** p-value 2 phía từ thống kê t, xấp xỉ bằng phân phối chuẩn (chính xác khi bậc tự do lớn — luôn đúng ở đây vì n >> p). */
+function twoTailedPValue(tStat: number): number {
+  return 2 * (1 - normalCdf(Math.abs(tStat)));
 }
 
-function stdev(arr: number[]): number {
-  if (arr.length === 0) return 0;
-  const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
-  const variance = arr.reduce((a, b) => a + (b - mean) ** 2, 0) / arr.length;
-  return Math.sqrt(variance);
-}
-
-/** Giờ Việt Nam hiện tại có đang trong phiên giao dịch không (9h-15h, T2-T6)? */
-function isVnMarketHoursNow(): boolean {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "Asia/Ho_Chi_Minh",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-    weekday: "short",
-  }).formatToParts(new Date());
-  const map: Record<string, string> = {};
-  parts.forEach((p) => (map[p.type] = p.value));
-  const minutesNow = parseInt(map.hour, 10) * 60 + parseInt(map.minute, 10);
-  const isWeekday = map.weekday !== "Sat" && map.weekday !== "Sun";
-  return isWeekday && minutesNow >= 9 * 60 && minutesNow < 15 * 60;
-}
-
-/** Ngày hôm nay theo giờ Việt Nam, dạng YYYY-MM-DD. */
-function vnTodayDateString(): string {
-  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Ho_Chi_Minh" }).format(new Date());
+function pearsonCorrelation(xs: number[], ys: number[]): number | null {
+  const n = xs.length;
+  if (n < 3) return null;
+  const meanX = xs.reduce((a, b) => a + b, 0) / n;
+  const meanY = ys.reduce((a, b) => a + b, 0) / n;
+  let num = 0;
+  let denX = 0;
+  let denY = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - meanX;
+    const dy = ys[i] - meanY;
+    num += dx * dy;
+    denX += dx * dx;
+    denY += dy * dy;
+  }
+  const den = Math.sqrt(denX * denY);
+  return den > 0 ? num / den : null;
 }
 
 /**
- * Số giây cho tới lần mở cửa thị trường VN tiếp theo (9h sáng ngày làm việc
- * gần nhất). Trả về 0 nếu đang trong giờ giao dịch (không cần cache dài).
- * Dùng để cache dữ liệu cuối tuần: vì T7/CN thị trường đóng cửa, dữ liệu
- * không đổi — cache tới sáng T2 giúp cuối tuần không cần gọi API sống nữa,
- * tránh phụ thuộc vào việc nguồn dữ liệu bên ngoài có ổn định ngoài giờ hay
- * không.
+ * Hồi quy tuyến tính bội (OLS) qua phương trình chuẩn (XᵀX)β = XᵀY, kèm sai số
+ * chuẩn và p-value cho từng hệ số — để biết hệ số nào thực sự có ý nghĩa
+ * thống kê (p<0.05) thay vì chỉ nhìn dấu +/- của ước lượng điểm.
  */
-export function secondsUntilNextMarketOpen(): number {
-  const ictOffsetMs = 7 * 60 * 60 * 1000; // giờ VN cố định UTC+7, không DST
-  const nowUtcMs = Date.now();
-  const nowIct = new Date(nowUtcMs + ictOffsetMs);
-  const y = nowIct.getUTCFullYear();
-  const m = nowIct.getUTCMonth();
-  const d = nowIct.getUTCDate();
-  const weekday = nowIct.getUTCDay(); // 0=CN .. 6=T7 (theo mốc giờ đã dịch sang ICT)
-  const minutesNow = nowIct.getUTCHours() * 60 + nowIct.getUTCMinutes();
+function ols(
+  X: number[][],
+  y: number[]
+): { coefs: number[]; standardErrors: (number | null)[]; pValues: (number | null)[]; r2: number } | null {
+  const n = X.length;
+  const p = X[0].length;
+  const XtX: number[][] = Array.from({ length: p }, () => new Array(p).fill(0));
+  const XtY: number[] = new Array(p).fill(0);
 
-  if (weekday >= 1 && weekday <= 5 && minutesNow >= 9 * 60 && minutesNow < 15 * 60) {
-    return 0; // đang trong giờ giao dịch — không cần cache dài
-  }
-
-  function marketOpenUtcMs(dayOffset: number): number {
-    return Date.UTC(y, m, d + dayOffset, 9, 0, 0) - ictOffsetMs;
-  }
-
-  let dayOffset = 0;
-  for (let i = 0; i <= 10; i++) {
-    const candidateWeekday = (weekday + dayOffset) % 7;
-    const isWeekday = candidateWeekday >= 1 && candidateWeekday <= 5;
-    if (isWeekday && marketOpenUtcMs(dayOffset) > nowUtcMs) break;
-    dayOffset++;
-  }
-
-  return Math.max(60, Math.round((marketOpenUtcMs(dayOffset) - nowUtcMs) / 1000));
-}
-
-/** Thử lại khi gọi mạng thất bại (timeout, rate-limit tạm thời...), có độ trễ tăng dần. */
-export async function withRetry<T>(fn: () => Promise<T>, retries = 2, baseDelayMs = 800): Promise<T> {
-  let lastErr: unknown;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      if (attempt < retries) {
-        await new Promise((resolve) => setTimeout(resolve, baseDelayMs * (attempt + 1)));
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < p; j++) {
+      XtY[j] += X[i][j] * y[i];
+      for (let k = 0; k < p; k++) {
+        XtX[j][k] += X[i][j] * X[i][k];
       }
     }
   }
-  throw lastErr;
-}
 
-/** Bỏ nến "hôm nay" nếu phiên chưa đóng cửa (xem giải thích ở scoreShortTerm). */
-export function trimUnclosedBar<T extends { date: string | Date }>(bars: T[]): T[] {
-  if (!isVnMarketHoursNow()) return bars;
-  const today = vnTodayDateString();
-  const last = bars.at(-1);
-  if (last && String(last.date).slice(0, 10) === today) {
-    return bars.slice(0, -1);
+  const invXtX = invertMatrix(XtX);
+  if (!invXtX) return null;
+
+  const coefs = invXtX.map((row) => row.reduce((s, v, j) => s + v * XtY[j], 0));
+
+  const yMean = y.reduce((a, b) => a + b, 0) / n;
+  let ssTot = 0;
+  let ssRes = 0;
+  for (let i = 0; i < n; i++) {
+    const pred = X[i].reduce((s, xij, j) => s + xij * coefs[j], 0);
+    ssRes += (y[i] - pred) ** 2;
+    ssTot += (y[i] - yMean) ** 2;
   }
-  return bars;
-}
+  const r2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
 
-/**
- * ADX / DI+ / DI- (Wilder) — đo ĐỘ MẠNH của xu hướng, không phải chiều xu hướng.
- * vnstock-js không có sẵn nên tự tính từ OHLC (công thức Wilder chuẩn, xấp xỉ
- * bằng EMA alpha=1/period).
- */
-function computeADX(
-  bars: { high: number; low: number; close: number }[],
-  period = 14
-): { adx: number | null; diPlus: number | null; diMinus: number | null } {
-  if (bars.length < period * 2) return { adx: null, diPlus: null, diMinus: null };
-
-  const tr: number[] = [];
-  const plusDM: number[] = [];
-  const minusDM: number[] = [];
-
-  for (let i = 1; i < bars.length; i++) {
-    const upMove = bars[i].high - bars[i - 1].high;
-    const downMove = bars[i - 1].low - bars[i].low;
-    plusDM.push(upMove > downMove && upMove > 0 ? upMove : 0);
-    minusDM.push(downMove > upMove && downMove > 0 ? downMove : 0);
-    tr.push(
-      Math.max(
-        bars[i].high - bars[i].low,
-        Math.abs(bars[i].high - bars[i - 1].close),
-        Math.abs(bars[i].low - bars[i - 1].close)
-      )
-    );
-  }
-
-  const wilderSmooth = (arr: number[]): number[] => {
-    const alpha = 1 / period;
-    const out: number[] = [arr[0]];
-    for (let i = 1; i < arr.length; i++) {
-      out.push(alpha * arr[i] + (1 - alpha) * out[i - 1]);
-    }
-    return out;
-  };
-
-  const atrSm = wilderSmooth(tr);
-  const plusSm = wilderSmooth(plusDM);
-  const minusSm = wilderSmooth(minusDM);
-
-  const diPlusSeries = plusSm.map((v, i) => (atrSm[i] ? (100 * v) / atrSm[i] : 0));
-  const diMinusSeries = minusSm.map((v, i) => (atrSm[i] ? (100 * v) / atrSm[i] : 0));
-  const dxSeries = diPlusSeries.map((v, i) => {
-    const sum = v + diMinusSeries[i];
-    return sum ? (100 * Math.abs(v - diMinusSeries[i])) / sum : 0;
+  const dof = n - p;
+  const sigma2 = dof > 0 ? ssRes / dof : null;
+  const standardErrors = coefs.map((_, j) =>
+    sigma2 !== null && invXtX[j][j] > 0 ? Math.sqrt(sigma2 * invXtX[j][j]) : null
+  );
+  const pValues = coefs.map((c, j) => {
+    const se = standardErrors[j];
+    if (se === null || se === 0) return null;
+    return twoTailedPValue(c / se);
   });
-  const adxSeries = wilderSmooth(dxSeries);
 
-  return {
-    adx: adxSeries.at(-1) ?? null,
-    diPlus: diPlusSeries.at(-1) ?? null,
-    diMinus: diMinusSeries.at(-1) ?? null,
-  };
+  return { coefs, standardErrors, pValues, r2 };
 }
 
-/** Tìm chỉ số các đỉnh cục bộ (pivot highs): lớn hơn `order` điểm cả 2 phía. */
-function findPivotHighIdx(values: number[], order: number): number[] {
-  const idxs: number[] = [];
-  for (let i = order; i < values.length - order; i++) {
-    const window = values.slice(i - order, i + order + 1);
-    if (values[i] === Math.max(...window)) idxs.push(i);
-  }
-  return idxs;
-}
-
-/** Tìm chỉ số các đáy cục bộ (pivot lows). */
-function findPivotLowIdx(values: number[], order: number): number[] {
-  const idxs: number[] = [];
-  for (let i = order; i < values.length - order; i++) {
-    const window = values.slice(i - order, i + order + 1);
-    if (values[i] === Math.min(...window)) idxs.push(i);
-  }
-  return idxs;
+interface Sample {
+  date: string;
+  ticker: string;
+  features: number[];
+  forwardReturn: number;
 }
 
 /**
- * Phát hiện phân kỳ (divergence) bằng cách so 2 pivot gần nhất của giá và của
- * chỉ báo trong `lookback` phiên gần nhất — tín hiệu đảo chiều SỚM, khác hẳn
- * loại tín hiệu "đọc mức giá trị hiện tại" như RSI/MACD ở trên.
- *
- * Ngưỡng "chênh lệch đáng kể" của chỉ báo được tính theo độ lệch chuẩn cục bộ
- * (thay vì số tuyệt đối như "3 điểm" cố định) để dùng chung được cho cả RSI
- * (thang 0-100) lẫn MACD histogram (thang nhỏ hơn nhiều, có thể âm).
+ * Lấy dữ liệu 500 ngày cho toàn bộ watchlist (theo từng đợt nhỏ để không quá
+ * tải nguồn dữ liệu), rồi trích mẫu (features, forward return, ngày) tại
+ * nhiều mốc thời gian quá khứ cho từng mã — dùng chung cho cả
+ * runWeightRegression (fit trên toàn bộ) và runTrainTestSplit (fit/test
+ * tách theo thời gian).
  */
-function detectDivergence(
-  price: number[],
-  indicator: number[],
-  order = 5,
-  lookback = 60
-): { bullish: boolean; bearish: boolean } {
-  const n = price.length;
-  if (n < lookback + order * 2) return { bullish: false, bearish: false };
+async function gatherSamples(
+  tickers: string[],
+  forwardDays: number
+): Promise<{ samples: Sample[]; histories: { ticker: string; history: any }[] }> {
+  const fns = await getVnstock();
+  const lookbackCalendarDays = 500;
+  const start = new Date();
+  start.setDate(start.getDate() - lookbackCalendarDays);
+  const startStr = start.toISOString().slice(0, 10);
 
-  const p = price.slice(n - lookback);
-  const ind = indicator.slice(n - lookback);
-  if (ind.some((v) => Number.isNaN(v))) return { bullish: false, bearish: false };
+  let vni = await withRetry(() => fns.stock.quote({ ticker: "VNINDEX", start: startStr }));
+  vni = trimUnclosedBar(vni);
 
-  const epsilon = Math.max(stdev(ind) * 0.3, 0.01);
-
-  const priceHighIdx = findPivotHighIdx(p, order);
-  const indHighIdx = findPivotHighIdx(ind, order);
-  let bearish = false;
-  if (priceHighIdx.length >= 2 && indHighIdx.length >= 2) {
-    const p2 = p[priceHighIdx.at(-1)!];
-    const p1 = p[priceHighIdx.at(-2)!];
-    const i2 = ind[indHighIdx.at(-1)!];
-    const i1 = ind[indHighIdx.at(-2)!];
-    if (p2 > p1 * 1.005 && i2 < i1 - epsilon) bearish = true;
+  function vniChg5dAt(history: { date: string }[], cutoff: number): number | null {
+    if (!vni || vni.length === 0) return null;
+    const targetDate = String(history[cutoff].date).slice(0, 10);
+    const idx = vni.findIndex((b) => String(b.date).slice(0, 10) === targetDate);
+    if (idx < 6) return null;
+    return pctChange(vni[idx - 5].close, vni[idx].close);
   }
 
-  const priceLowIdx = findPivotLowIdx(p, order);
-  const indLowIdx = findPivotLowIdx(ind, order);
-  let bullish = false;
-  if (priceLowIdx.length >= 2 && indLowIdx.length >= 2) {
-    const p2 = p[priceLowIdx.at(-1)!];
-    const p1 = p[priceLowIdx.at(-2)!];
-    const i2 = ind[indLowIdx.at(-1)!];
-    const i1 = ind[indLowIdx.at(-2)!];
-    if (p2 < p1 * 0.995 && i2 > i1 + epsilon) bullish = true;
-  }
-
-  return { bullish, bearish };
-}
-
-/** Các hàm chỉ báo lấy từ vnstock-js — dùng chung cho cả live scoring và backtest. */
-export interface IndicatorFns {
-  rsi: (data: any) => any[];
-  macd: (data: any) => any[];
-  sma: (data: any, opts: { period: number }) => any[];
-  bollinger: (data: any, opts: { period: number; stddev: number }) => any[];
-  atr: (data: any, period: number) => any[];
-  superTrend: (data: any) => any[];
-}
-
-/**
- * Chấm điểm momentum ngắn hạn từ 1 mảng OHLCV đã có sẵn (không tự fetch dữ
- * liệu) — tách riêng để DÙNG CHUNG cho cả live scoring (scoreShortTerm) và
- * backtest (xem src/lib/backtest.ts): backtest gọi hàm này với `history` đã
- * cắt tới từng mốc thời gian trong quá khứ, đảm bảo không có "lookahead bias"
- * (không lỡ dùng dữ liệu tương lai để chấm điểm quá khứ) vì cả 2 nơi dùng
- * đúng 1 logic.
- *
- * Đây KHÔNG phải khuyến nghị đầu tư — chỉ tổng hợp chỉ báo kỹ thuật lịch sử.
- */
-export function computeScoreFromHistory(
-  ticker: string,
-  history: OhlcvBar[],
-  vniChg5d: number | null,
-  foreignNetRatio: number | null,
-  { rsi, macd, sma, bollinger, atr, superTrend }: IndicatorFns
-): ShortTermResult | null {
-  if (!history || history.length < 55) return null;
-
-  const rsiSeries = rsi(history);
-  const macdSeries = macd(history);
-  const sma20Series = sma(history, { period: 20 });
-  const sma50Series = sma(history, { period: 50 });
-  const bbSeries = bollinger(history, { period: 20, stddev: 2 });
-  const atrSeries = atr(history, 14);
-  const stSeries = superTrend(history);
-  const { adx, diPlus, diMinus } = computeADX(history, 14);
-
-  const lastRsi = rsiSeries?.at(-1)?.rsi ?? null;
-
-  const lastMacd = macdSeries?.at(-1)?.histogram ?? null;
-  const prevMacd = macdSeries?.at(-4)?.histogram ?? null; // so với 3 phiên trước
-  const macdHistogram = lastMacd;
-  const macdRising =
-    lastMacd !== null && prevMacd !== null ? lastMacd > prevMacd : null;
-
-  const closeNow = history.at(-1)?.close ?? 0;
-  const sma20 = sma20Series?.at(-1)?.sma ?? null;
-  const sma50 = sma50Series?.at(-1)?.sma ?? null;
-  const priceVsSma20Pct = sma20 ? pctChange(sma20, closeNow) : null;
-  const trendAligned =
-    sma20 !== null && sma50 !== null ? closeNow > sma20 && sma20 > sma50 : null;
-
-  const superTrendDirection = stSeries?.at(-1)?.direction ?? null;
-
-  const bollingerPercentB = bbSeries?.at(-1)?.percentB ?? null;
-
-  const lastAtr = atrSeries?.at(-1)?.atr ?? null;
-  const atrPercent = lastAtr && closeNow ? (lastAtr / closeNow) * 100 : null;
-
-  const adxBullish = diPlus !== null && diMinus !== null ? diPlus > diMinus : null;
-
-  const recent20 = history.slice(-20);
-  const avgVol20 = recent20.reduce((sum, r) => sum + r.volume, 0) / recent20.length;
-  const lastVol = history.at(-1)?.volume ?? 0;
-  const volumeRatio = avgVol20 > 0 ? lastVol / avgVol20 : null;
-
-  const close5dAgo = history.at(-6)?.close ?? closeNow;
-  const priceChange5d = pctChange(close5dAgo, closeNow);
-
-  const relativeStrength5d = vniChg5d !== null ? priceChange5d - vniChg5d : null;
-
-  // Phân kỳ RSI & MACD qua pivot points — tín hiệu đảo chiều sớm
-  const closeArr = history.map((r) => r.close);
-  const rsiArr = rsiSeries.map((r: any) => r.rsi ?? NaN);
-  const macdHistArr = macdSeries.map((r: any) => r.histogram ?? NaN);
-  const rsiDiv = detectDivergence(closeArr, rsiArr, 5, 60);
-  const macdDiv = detectDivergence(closeArr, macdHistArr, 5, 60);
-
-  // Hỗ trợ/kháng cự 20 phiên — dùng làm cơ sở đặt stop-loss & mục tiêu giá
-  const support20 = Math.min(...recent20.map((r) => r.low));
-  const resistance20 = Math.max(...recent20.map((r) => r.high));
-  const stopLoss = support20 > 0 ? support20 * 0.99 : null;
-  const target1 =
-    lastAtr !== null ? Math.max(resistance20, closeNow + 2 * lastAtr) : resistance20 || null;
-  const riskReward =
-    stopLoss !== null && target1 !== null && closeNow - stopLoss > 0
-      ? (target1 - closeNow) / (closeNow - stopLoss)
-      : null;
-
-  // --- Chấm điểm 0-100, cộng dồn theo từng dải giá trị cụ thể ---
-  let score = 50;
-  const reasons: string[] = [];
-
-  // 1) Cấu trúc xu hướng: SMA20/50 + SuperTrend + ADX
-  if (trendAligned === true) {
-    score += 15;
-    reasons.push("Giá > SMA20 > SMA50 (xu hướng tăng rõ ràng)");
-  } else if (trendAligned === false) {
-    score -= 15;
-    reasons.push("Cấu trúc SMA cho thấy xu hướng chưa thuận lợi");
-  }
-  if (superTrendDirection === "bullish") {
-    score += 10;
-    reasons.push("SuperTrend xác nhận xu hướng tăng");
-  } else if (superTrendDirection === "bearish") {
-    score -= 10;
-    reasons.push("SuperTrend đang ở chiều giảm");
-  }
-  if (adx !== null && adxBullish !== null) {
-    if (adx > 25 && adxBullish) {
-      score += 10;
-      reasons.push(`ADX ${adx.toFixed(0)} xác nhận xu hướng tăng mạnh, không phải nhiễu`);
-    } else if (adx > 25 && !adxBullish) {
-      score -= 10;
-      reasons.push(`ADX ${adx.toFixed(0)} cho thấy phe bán đang mạnh`);
-    } else if (adx < 20) {
-      score -= 3;
-      reasons.push(`ADX ${adx.toFixed(0)} thấp — thị trường đang đi ngang, tín hiệu kém tin cậy`);
-    }
-  }
-
-  // 2) RSI — vùng động lượng khỏe mà chưa quá mua
-  if (lastRsi !== null) {
-    if (lastRsi >= 50 && lastRsi <= 65) {
-      score += 15;
-      reasons.push(`RSI ${lastRsi.toFixed(1)} trong vùng động lượng khỏe`);
-    } else if (lastRsi > 65 && lastRsi <= 72) {
-      score += 6;
-      reasons.push(`RSI ${lastRsi.toFixed(1)} mạnh nhưng gần vùng quá mua`);
-    } else if (lastRsi > 72) {
-      score -= 8;
-      reasons.push(`RSI ${lastRsi.toFixed(1)} quá mua, rủi ro điều chỉnh`);
-    } else if (lastRsi >= 40) {
-      score += 3;
-    } else {
-      score -= 10;
-      reasons.push(`RSI ${lastRsi.toFixed(1)} yếu`);
-    }
-  }
-
-  // 3) MACD — động lượng có đang tăng tốc không, không chỉ dương/âm
-  if (macdHistogram !== null) {
-    if (macdHistogram > 0 && macdRising) {
-      score += 15;
-      reasons.push("MACD dương và đang tăng tốc");
-    } else if (macdHistogram > 0) {
-      score += 7;
-      reasons.push("MACD dương nhưng động lượng chững lại");
-    } else {
-      score -= 10;
-      reasons.push("MACD âm, động lượng yếu");
-    }
-  }
-
-  // 4) Phân kỳ RSI/MACD — tín hiệu đảo chiều sớm, độc lập với mức giá trị hiện tại
-  if (rsiDiv.bullish) {
-    score += 8;
-    reasons.push("Phân kỳ tăng trên RSI — tín hiệu đảo chiều sớm");
-  }
-  if (rsiDiv.bearish) {
-    score -= 8;
-    reasons.push("Phân kỳ giảm trên RSI — cảnh báo đảo chiều");
-  }
-  if (macdDiv.bullish) {
-    score += 8;
-    reasons.push("Phân kỳ tăng trên MACD");
-  }
-  if (macdDiv.bearish) {
-    score -= 8;
-    reasons.push("Phân kỳ giảm trên MACD");
-  }
-
-  // 5) Bollinger %B — vị trí trong dải, tránh mua đuổi khi đã quá dải trên
-  if (bollingerPercentB !== null) {
-    if (bollingerPercentB > 1.0) {
-      score -= 8;
-      reasons.push("Giá vượt dải trên Bollinger, có thể đã quá đà");
-    } else if (bollingerPercentB >= 0.5) {
-      score += 10;
-      reasons.push("Giá ở nửa trên dải Bollinger, còn dư địa tăng");
-    } else if (bollingerPercentB >= 0.2) {
-      score += 2;
-    } else {
-      score -= 8;
-      reasons.push("Giá gần dải dưới Bollinger, xu hướng yếu");
-    }
-  }
-
-  // 6) Khối lượng xác nhận
-  if (volumeRatio !== null) {
-    if (volumeRatio > 1.5) {
-      score += 15;
-      reasons.push(`Khối lượng gấp ${volumeRatio.toFixed(1)}x TB 20 phiên`);
-    } else if (volumeRatio > 1.2) {
-      score += 8;
-      reasons.push(`Khối lượng cao hơn ${((volumeRatio - 1) * 100).toFixed(0)}% TB 20 phiên`);
-    } else if (volumeRatio < 0.8) {
-      score -= 5;
-    }
-  }
-
-  // 7) Khối ngoại mua/bán ròng — nguồn thông tin độc lập với giá/KL nội bộ
-  if (foreignNetRatio !== null) {
-    if (foreignNetRatio > 10) {
-      score += 10;
-      reasons.push(`Khối ngoại mua ròng mạnh (${foreignNetRatio.toFixed(1)}% tổng KL)`);
-    } else if (foreignNetRatio > 3) {
-      score += 5;
-      reasons.push(`Khối ngoại mua ròng (${foreignNetRatio.toFixed(1)}% tổng KL)`);
-    } else if (foreignNetRatio < -10) {
-      score -= 10;
-      reasons.push(`Khối ngoại bán ròng mạnh (${foreignNetRatio.toFixed(1)}% tổng KL)`);
-    } else if (foreignNetRatio < -3) {
-      score -= 5;
-      reasons.push(`Khối ngoại bán ròng (${foreignNetRatio.toFixed(1)}% tổng KL)`);
-    }
-  }
-
-  // 8) Sức mạnh tương đối so với VNINDEX — mã có đang dẫn dắt thị trường không
-  if (relativeStrength5d !== null) {
-    if (relativeStrength5d > 3) {
-      score += 8;
-      reasons.push(`Mạnh hơn VNINDEX ${relativeStrength5d.toFixed(1)}% trong 5 phiên — đang dẫn dắt`);
-    } else if (relativeStrength5d > 1) {
-      score += 4;
-    } else if (relativeStrength5d < -3) {
-      score -= 8;
-      reasons.push(`Yếu hơn VNINDEX ${Math.abs(relativeStrength5d).toFixed(1)}% trong 5 phiên`);
-    } else if (relativeStrength5d < -1) {
-      score -= 4;
-    }
-  }
-
-  // 9) Biến động giá 5 phiên — tăng khỏe nhưng chưa quá "đuổi giá"
-  if (priceChange5d > 2 && priceChange5d <= 8) {
-    score += 10;
-    reasons.push(`Giá tăng ${priceChange5d.toFixed(1)}% trong 5 phiên, nhịp tăng khỏe`);
-  } else if (priceChange5d > 8 && priceChange5d <= 15) {
-    score += 4;
-    reasons.push(`Giá tăng ${priceChange5d.toFixed(1)}%, bắt đầu hơi nóng`);
-  } else if (priceChange5d > 15) {
-    score -= 5;
-    reasons.push(`Giá tăng nóng ${priceChange5d.toFixed(1)}% trong 5 phiên, rủi ro đuổi giá`);
-  } else if (priceChange5d >= 0) {
-    score += 3;
-  } else {
-    score -= 5;
-  }
-
-  // 10) Rủi ro biến động — ATR quá cao so với giá làm việc canh điểm vào/ra khó hơn
-  if (atrPercent !== null && atrPercent > 5) {
-    score -= 3;
-    reasons.push(`ATR ${atrPercent.toFixed(1)}% giá — biến động cao, cần quản trị rủi ro chặt`);
-  }
-
-  return {
-    ticker,
-    score: Math.round(Math.max(0, Math.min(100, score))),
-    lastClose: closeNow,
-    rsi14: lastRsi,
-    macdHistogram,
-    macdRising,
-    sma20,
-    sma50,
-    priceVsSma20Pct,
-    trendAligned,
-    superTrend: superTrendDirection,
-    bollingerPercentB,
-    atrPercent,
-    adx,
-    adxBullish,
-    volumeRatio,
-    priceChange5d,
-    foreignNetRatio,
-    relativeStrength5d,
-    rsiBullDiv: rsiDiv.bullish,
-    rsiBearDiv: rsiDiv.bearish,
-    macdBullDiv: macdDiv.bullish,
-    macdBearDiv: macdDiv.bearish,
-    stopLoss,
-    target1,
-    riskReward,
-    reason: reasons.join("; ") || "Không đủ dữ liệu để đánh giá",
-  };
-}
-
-/**
- * Market breadth: lấy xu hướng VNINDEX để điều chỉnh điểm toàn watchlist, và
- * trả về chg5d để dùng tính "sức mạnh tương đối" cho từng mã.
- * Nếu lấy dữ liệu VNINDEX thất bại, trả về null và bỏ qua các bước phụ thuộc
- * (không chặn toàn bộ kết quả vì 1 phần phụ này lỗi).
- */
-async function fetchMarketBreadth(): Promise<MarketBreadth | null> {
-  try {
-    const { stock } = await getVnstock();
-    const start = new Date();
-    start.setDate(start.getDate() - 20);
-
-    let vni = await withRetry(() =>
-      stock.quote({
-        ticker: "VNINDEX",
-        start: start.toISOString().slice(0, 10),
+  // Lấy dữ liệu 500 ngày cho 20 mã CÙNG LÚC dễ khiến nguồn dữ liệu chậm/timeout
+  // một phần do payload lớn — chia thành từng đợt nhỏ (5 mã/đợt) để ổn định hơn.
+  const BATCH_SIZE = 5;
+  const histories: { ticker: string; history: any }[] = [];
+  for (let i = 0; i < tickers.length; i += BATCH_SIZE) {
+    const batch = tickers.slice(i, i + BATCH_SIZE);
+    const batchResults = await Promise.all(
+      batch.map(async (ticker) => {
+        try {
+          let h = await withRetry(() => fns.stock.quote({ ticker, start: startStr }));
+          h = trimUnclosedBar(h);
+          return { ticker, history: h };
+        } catch (err) {
+          console.error(`gatherSamples: lỗi khi lấy dữ liệu ${ticker}`, err);
+          return { ticker, history: null };
+        }
       })
     );
-    vni = trimUnclosedBar(vni);
-    if (!vni || vni.length < 6) return null;
-
-    const last = vni.at(-1)!.close;
-    const prev = vni.at(-2)!.close;
-    const prev5 = vni.at(-6)!.close;
-    const chg1d = pctChange(prev, last);
-    const chg5d = pctChange(prev5, last);
-
-    let adjustment = 0;
-    if (chg1d < -1.5) adjustment = -8;
-    else if (chg1d < -0.5) adjustment = -4;
-    else if (chg1d > 1.5) adjustment = 5;
-    else if (chg1d > 0.5) adjustment = 3;
-
-    const trend: MarketBreadth["trend"] =
-      chg1d > 0.5 ? "bull" : chg1d < -0.5 ? "bear" : "neutral";
-
-    return { trend, chg1d, chg5d, adjustment };
-  } catch (err) {
-    console.error("fetchMarketBreadth failed:", err);
-    return null;
+    histories.push(...batchResults);
   }
-}
 
-/**
- * Khối ngoại mua/bán ròng cho cả watchlist trong 1 lần gọi — nguồn dữ liệu
- * ĐỘC LẬP với giá/khối lượng nội bộ (không suy ra được từ các chỉ báo kỹ
- * thuật khác), nên bổ sung thông tin thực sự mới cho scoring.
- */
-async function fetchForeignFlow(universe: string[]): Promise<Map<string, number>> {
-  const map = new Map<string, number>();
-  try {
-    const { Vnstock } = await getVnstock();
-    const board = await withRetry(() => new Vnstock().stock.trading.priceBoard(universe));
-    for (const row of board as Record<string, any>[]) {
-      const buy = row.foreignBuyVolume ?? 0;
-      const sell = row.foreignSellVolume ?? 0;
-      const total = row.totalVolume ?? row.matchVolume ?? 0;
-      if (total > 0) {
-        map.set(String(row.symbol).toUpperCase(), ((buy - sell) / total) * 100);
-      }
-    }
-  } catch (err) {
-    console.error("fetchForeignFlow failed:", err);
-  }
-  return map;
-}
+  const validCount = histories.filter((h) => h.history && h.history.length >= 120).length;
+  console.log(`[gatherSamples] ${validCount}/${tickers.length} mã lấy dữ liệu thành công`);
 
-/** Wrapper: lấy dữ liệu mới nhất cho 1 mã rồi chấm điểm bằng computeScoreFromHistory. */
-async function scoreShortTerm(
-  ticker: string,
-  vniChg5d: number | null,
-  foreignNetRatio: number | null
-): Promise<ShortTermResult | null> {
-  try {
-    const fns = await getVnstock();
-    const start = new Date();
-    start.setDate(start.getDate() - 150); // ~5 tháng để SMA50/ATR/divergence đủ dữ liệu ổn định
+  const samples: Sample[] = [];
+  const stepDays = 5;
+  const minStart = 90;
 
-    let history = await withRetry(() =>
-      fns.stock.quote({
+  for (const { ticker, history } of histories) {
+    if (!history || history.length < 120) continue;
+    const maxCutoff = history.length - forwardDays - 1;
+    for (let cutoff = minStart; cutoff <= maxCutoff; cutoff += stepDays) {
+      const slice = history.slice(0, cutoff + 1);
+      const result = computeScoreFromHistory(ticker, slice, vniChg5dAt(history, cutoff), null, fns);
+      if (!result) continue;
+      const forwardReturn = pctChange(history[cutoff].close, history[cutoff + forwardDays].close);
+      samples.push({
+        date: String(history[cutoff].date).slice(0, 10),
         ticker,
-        start: start.toISOString().slice(0, 10),
-      })
-    );
-
-    if (!history || history.length < 55) return null;
-
-    // Trong giờ giao dịch, nến "hôm nay" vẫn đang hình thành (giá đóng cửa tạm
-    // thời cập nhật liên tục) — dùng nó để tính RSI/MACD/SMA/Bollinger sẽ khiến
-    // điểm số nhảy loạn suốt phiên. Bỏ nến này đi, chỉ tính trên các phiên đã
-    // đóng cửa thực sự; điểm số sẽ chỉ đổi 1 lần/ngày, sau khi thị trường đóng cửa.
-    history = trimUnclosedBar(history);
-
-    return computeScoreFromHistory(ticker, history, vniChg5d, foreignNetRatio, fns);
-  } catch (err) {
-    console.error(`scoreShortTerm failed for ${ticker}:`, err);
-    return null;
+        features: FEATURES.map((f) => f.extract(result)),
+        forwardReturn,
+      });
+    }
   }
+
+  console.log(`[gatherSamples] thu được ${samples.length} mẫu`);
+  return { samples, histories };
 }
 
-export async function runAnalysis(universe: string[] = DEFAULT_UNIVERSE) {
-  const { init } = await getVnstock();
-  // os.homedir() không ghi được trên Vercel serverless — chỉ /tmp là ghi được.
-  await init({ cacheDir: path.join(os.tmpdir(), "vnstock-js-cache") });
+/**
+ * Fit hồi quy trên TOÀN BỘ dữ liệu backtest gộp, rồi áp hệ số vào dữ liệu MỚI
+ * NHẤT của từng mã để đưa ra "return kỳ vọng" — dùng để CHẨN ĐOÁN hướng chấm
+ * điểm, không phải kiểm chứng nghiêm ngặt (xem runTrainTestSplit cho việc đó).
+ */
+export async function runWeightRegression(
+  tickers: string[],
+  forwardDays = 5
+): Promise<RegressionResult | null> {
+  const fns = await getVnstock();
+  const { samples, histories } = await gatherSamples(tickers, forwardDays);
 
-  // Lấy VNINDEX + khối ngoại trước (cần cho mọi mã), rồi mới chấm điểm song song từng mã
-  const [marketBreadth, foreignFlow] = await Promise.all([
-    fetchMarketBreadth(),
-    fetchForeignFlow(universe),
-  ]);
+  if (samples.length < FEATURES.length * 10) return null; // không đủ mẫu để hồi quy đáng tin cậy
 
-  const shortTermSettled = await Promise.all(
-    universe.map((t) =>
-      scoreShortTerm(t, marketBreadth?.chg5d ?? null, foreignFlow.get(t) ?? null)
-    )
-  );
-
-  let shortTermRanked = shortTermSettled.filter(
-    (r): r is ShortTermResult => r !== null
-  );
-
-  // Áp điều chỉnh market breadth cho toàn bộ watchlist rồi xếp hạng lại
-  if (marketBreadth && marketBreadth.adjustment !== 0) {
-    shortTermRanked = shortTermRanked.map((r) => ({
-      ...r,
-      score: Math.round(Math.max(0, Math.min(100, r.score + marketBreadth.adjustment))),
-    }));
+  const X = samples.map((s) => s.features);
+  const y = samples.map((s) => s.forwardReturn);
+  const fit = ols(X, y);
+  if (!fit) {
+    console.error(
+      "[runWeightRegression] ols() thất bại — ma trận suy biến (có biến bị hằng số/đa cộng tuyến hoàn toàn)"
+    );
+    return null;
   }
-  shortTermRanked = shortTermRanked.sort((a, b) => b.score - a.score);
+
+  // Áp hệ số vừa fit vào dữ liệu MỚI NHẤT (toàn bộ history, không cắt) của
+  // từng mã để ra "return kỳ vọng" hôm nay. vniChg5d truyền null vì việc tính
+  // lại chỉ số VNINDEX tương ứng nằm trong gatherSamples (đã đóng lại phạm vi
+  // sau khi trả về) — computeScoreFromHistory xử lý null an toàn, chỉ khiến
+  // riêng feature "sức mạnh tương đối" của bước dự đoán hôm nay mặc định 0.
+  const predictions: PredictedPick[] = [];
+  for (const { ticker, history } of histories) {
+    if (!history || history.length < 120) continue;
+    const result = computeScoreFromHistory(ticker, history, null, null, fns);
+    if (!result) continue;
+    const features = FEATURES.map((f) => f.extract(result));
+    const predictedReturnPct = features.reduce((s, xi, i) => s + xi * fit.coefs[i], 0);
+    predictions.push({ ticker, lastClose: result.lastClose, predictedReturnPct });
+  }
+  predictions.sort((a, b) => b.predictedReturnPct - a.predictedReturnPct);
 
   return {
-    generatedAt: new Date().toISOString(),
-    marketBreadth,
-    shortTerm: {
-      best: shortTermRanked[0] ?? null,
-      ranked: shortTermRanked.slice(0, 15),
-    },
+    tickers,
+    forwardDays,
+    sampleCount: X.length,
+    r2: fit.r2,
+    coefficients: FEATURES.map((f, i) => ({
+      name: f.name,
+      label: f.label,
+      coef: fit.coefs[i],
+      standardError: fit.standardErrors[i],
+      pValue: fit.pValues[i],
+      significant: fit.pValues[i] !== null && (fit.pValues[i] as number) < 0.05,
+    })),
+    predictions,
+  };
+}
+
+/** Chia mẫu thành các nhóm (quartile) theo giá trị dự đoán, rồi tính return thật + tỷ lệ thắng trong từng nhóm. */
+function quantileBuckets(predicted: number[], actual: number[], numBuckets = 4): TrainTestBucket[] {
+  const order = predicted.map((_, i) => i).sort((a, b) => predicted[a] - predicted[b]);
+  const n = order.length;
+  const size = Math.floor(n / numBuckets);
+  const buckets: TrainTestBucket[] = [];
+  for (let b = 0; b < numBuckets; b++) {
+    const startI = b * size;
+    const endI = b === numBuckets - 1 ? n : (b + 1) * size;
+    const idx = order.slice(startI, endI);
+    if (idx.length === 0) continue;
+    const avgPred = idx.reduce((s, i) => s + predicted[i], 0) / idx.length;
+    const avgActual = idx.reduce((s, i) => s + actual[i], 0) / idx.length;
+    const winRate = (idx.filter((i) => actual[i] > 0).length / idx.length) * 100;
+    buckets.push({
+      label: `Q${b + 1} — dự đoán TB ${avgPred >= 0 ? "+" : ""}${avgPred.toFixed(2)}%`,
+      count: idx.length,
+      avgActualReturnPct: avgActual,
+      winRatePct: winRate,
+    });
+  }
+  return buckets;
+}
+
+/**
+ * Kiểm chứng NGHIÊM NGẶT: tách dữ liệu theo THỜI GIAN — fit hệ số chỉ trên
+ * `trainFraction` mẫu CŨ HƠN, rồi áp mô hình đó vào phần mẫu MỚI HƠN mà mô
+ * hình chưa từng thấy (out-of-sample). Nếu mô hình thực sự có giá trị, nhóm
+ * được dự đoán return cao (Q4) phải có return thực tế trung bình VÀ tỷ lệ
+ * thắng cao hơn rõ rệt so với nhóm dự đoán thấp (Q1). Tách theo thời gian
+ * (không phải ngẫu nhiên) vì đây là time-series — tách ngẫu nhiên sẽ rò rỉ
+ * thông tin giữa các mốc gần nhau.
+ */
+export async function runTrainTestSplit(
+  tickers: string[],
+  forwardDays = 5,
+  trainFraction = 0.7
+): Promise<TrainTestResult | null> {
+  const { samples } = await gatherSamples(tickers, forwardDays);
+
+  if (samples.length < FEATURES.length * 20) return null; // cần đủ cho cả train lẫn test
+
+  const sorted = [...samples].sort((a, b) => a.date.localeCompare(b.date));
+  const splitIdx = Math.floor(sorted.length * trainFraction);
+  const train = sorted.slice(0, splitIdx);
+  const test = sorted.slice(splitIdx);
+
+  console.log(
+    `[runTrainTestSplit] train=${train.length} (${train[0]?.date}→${train.at(-1)?.date}), test=${test.length} (${test[0]?.date}→${test.at(-1)?.date})`
+  );
+
+  if (train.length < FEATURES.length * 10 || test.length < 20) return null;
+
+  const fit = ols(
+    train.map((s) => s.features),
+    train.map((s) => s.forwardReturn)
+  );
+  if (!fit) {
+    console.error("[runTrainTestSplit] ols() trên tập train thất bại — ma trận suy biến");
+    return null;
+  }
+
+  const testX = test.map((s) => s.features);
+  const testY = test.map((s) => s.forwardReturn);
+  const predY = testX.map((x) => x.reduce((s, xi, i) => s + xi * fit.coefs[i], 0));
+
+  const testMean = testY.reduce((a, b) => a + b, 0) / testY.length;
+  let ssRes = 0;
+  let ssTot = 0;
+  for (let i = 0; i < testY.length; i++) {
+    ssRes += (testY[i] - predY[i]) ** 2;
+    ssTot += (testY[i] - testMean) ** 2;
+  }
+  const oosR2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
+  const oosCorrelation = pearsonCorrelation(predY, testY);
+  const buckets = quantileBuckets(predY, testY, 4);
+
+  return {
+    tickers,
+    forwardDays,
+    trainCount: train.length,
+    testCount: test.length,
+    trainDateRange: [train[0].date, train.at(-1)!.date],
+    testDateRange: [test[0].date, test.at(-1)!.date],
+    trainR2: fit.r2,
+    oosR2,
+    oosCorrelation,
+    buckets,
   };
 }
