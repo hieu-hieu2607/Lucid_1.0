@@ -2,7 +2,6 @@ import os from "os";
 import path from "path";
 import { getVnstock } from "./vnstock-client";
 
-
 // Rổ mã mặc định để quét — có thể mở rộng sau (VN30 tiêu biểu, thanh khoản tốt)
 export const DEFAULT_UNIVERSE = [
   "VCB", "MBB", "TCB", "CTG", "BID", "ACB", "VPB", "STB",
@@ -16,7 +15,6 @@ export interface MarketBreadth {
   chg5d: number;
   adjustment: number; // điểm cộng/trừ áp cho toàn bộ watchlist
 }
- 
 
 export interface OhlcvBar {
   date: string | Date;
@@ -88,6 +86,59 @@ function isVnMarketHoursNow(): boolean {
 /** Ngày hôm nay theo giờ Việt Nam, dạng YYYY-MM-DD. */
 function vnTodayDateString(): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Ho_Chi_Minh" }).format(new Date());
+}
+
+/**
+ * Số giây cho tới lần mở cửa thị trường VN tiếp theo (9h sáng ngày làm việc
+ * gần nhất). Trả về 0 nếu đang trong giờ giao dịch (không cần cache dài).
+ * Dùng để cache dữ liệu cuối tuần: vì T7/CN thị trường đóng cửa, dữ liệu
+ * không đổi — cache tới sáng T2 giúp cuối tuần không cần gọi API sống nữa,
+ * tránh phụ thuộc vào việc nguồn dữ liệu bên ngoài có ổn định ngoài giờ hay
+ * không.
+ */
+export function secondsUntilNextMarketOpen(): number {
+  const ictOffsetMs = 7 * 60 * 60 * 1000; // giờ VN cố định UTC+7, không DST
+  const nowUtcMs = Date.now();
+  const nowIct = new Date(nowUtcMs + ictOffsetMs);
+  const y = nowIct.getUTCFullYear();
+  const m = nowIct.getUTCMonth();
+  const d = nowIct.getUTCDate();
+  const weekday = nowIct.getUTCDay(); // 0=CN .. 6=T7 (theo mốc giờ đã dịch sang ICT)
+  const minutesNow = nowIct.getUTCHours() * 60 + nowIct.getUTCMinutes();
+
+  if (weekday >= 1 && weekday <= 5 && minutesNow >= 9 * 60 && minutesNow < 15 * 60) {
+    return 0; // đang trong giờ giao dịch — không cần cache dài
+  }
+
+  function marketOpenUtcMs(dayOffset: number): number {
+    return Date.UTC(y, m, d + dayOffset, 9, 0, 0) - ictOffsetMs;
+  }
+
+  let dayOffset = 0;
+  for (let i = 0; i <= 10; i++) {
+    const candidateWeekday = (weekday + dayOffset) % 7;
+    const isWeekday = candidateWeekday >= 1 && candidateWeekday <= 5;
+    if (isWeekday && marketOpenUtcMs(dayOffset) > nowUtcMs) break;
+    dayOffset++;
+  }
+
+  return Math.max(60, Math.round((marketOpenUtcMs(dayOffset) - nowUtcMs) / 1000));
+}
+
+/** Thử lại khi gọi mạng thất bại (timeout, rate-limit tạm thời...), có độ trễ tăng dần. */
+export async function withRetry<T>(fn: () => Promise<T>, retries = 2, baseDelayMs = 800): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt < retries) {
+        await new Promise((resolve) => setTimeout(resolve, baseDelayMs * (attempt + 1)));
+      }
+    }
+  }
+  throw lastErr;
 }
 
 /** Bỏ nến "hôm nay" nếu phiên chưa đóng cửa (xem giải thích ở scoreShortTerm). */
@@ -526,10 +577,12 @@ async function fetchMarketBreadth(): Promise<MarketBreadth | null> {
     const start = new Date();
     start.setDate(start.getDate() - 20);
 
-    let vni = await stock.quote({
-      ticker: "VNINDEX",
-      start: start.toISOString().slice(0, 10),
-    });
+    let vni = await withRetry(() =>
+      stock.quote({
+        ticker: "VNINDEX",
+        start: start.toISOString().slice(0, 10),
+      })
+    );
     vni = trimUnclosedBar(vni);
     if (!vni || vni.length < 6) return null;
 
@@ -564,7 +617,7 @@ async function fetchForeignFlow(universe: string[]): Promise<Map<string, number>
   const map = new Map<string, number>();
   try {
     const { Vnstock } = await getVnstock();
-    const board = await new Vnstock().stock.trading.priceBoard(universe);
+    const board = await withRetry(() => new Vnstock().stock.trading.priceBoard(universe));
     for (const row of board as Record<string, any>[]) {
       const buy = row.foreignBuyVolume ?? 0;
       const sell = row.foreignSellVolume ?? 0;
@@ -590,10 +643,12 @@ async function scoreShortTerm(
     const start = new Date();
     start.setDate(start.getDate() - 150); // ~5 tháng để SMA50/ATR/divergence đủ dữ liệu ổn định
 
-    let history = await fns.stock.quote({
-      ticker,
-      start: start.toISOString().slice(0, 10),
-    });
+    let history = await withRetry(() =>
+      fns.stock.quote({
+        ticker,
+        start: start.toISOString().slice(0, 10),
+      })
+    );
 
     if (!history || history.length < 55) return null;
 
