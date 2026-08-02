@@ -662,6 +662,7 @@ async function scoreShortTerm(
 }
 
 export async function runAnalysis(universe: string[] = DEFAULT_UNIVERSE) {
+  const t0 = Date.now();
   const { init } = await getVnstock();
   // os.homedir() không ghi được trên Vercel serverless — chỉ /tmp là ghi được.
   await init({ cacheDir: path.join(os.tmpdir(), "vnstock-js-cache") });
@@ -671,12 +672,24 @@ export async function runAnalysis(universe: string[] = DEFAULT_UNIVERSE) {
     fetchMarketBreadth(),
     fetchForeignFlow(universe),
   ]);
+  console.log(`[runAnalysis] xong market breadth + khối ngoại sau ${Date.now() - t0}ms`);
 
-  const shortTermSettled = await Promise.all(
-    universe.map((t) =>
-      scoreShortTerm(t, marketBreadth?.chg5d ?? null, foreignFlow.get(t) ?? null)
-    )
-  );
+  // Chia nhỏ theo từng đợt thay vì gọi tất cả cùng lúc — nếu nguồn dữ liệu
+  // giới hạn số request đồng thời từ cùng 1 IP, gọi hết 20 mã song song có
+  // thể khiến chúng bị xếp hàng phía server và cộng dồn thời gian, dễ vượt
+  // giới hạn 60s của serverless function.
+  const BATCH_SIZE = 6;
+  const shortTermSettled: (ShortTermResult | null)[] = [];
+  for (let i = 0; i < universe.length; i += BATCH_SIZE) {
+    const batch = universe.slice(i, i + BATCH_SIZE);
+    const batchResults = await Promise.all(
+      batch.map((t) => scoreShortTerm(t, marketBreadth?.chg5d ?? null, foreignFlow.get(t) ?? null))
+    );
+    shortTermSettled.push(...batchResults);
+    console.log(
+      `[runAnalysis] xong đợt ${Math.floor(i / BATCH_SIZE) + 1} (${batch.join(",")}) sau ${Date.now() - t0}ms tổng`
+    );
+  }
 
   let shortTermRanked = shortTermSettled.filter(
     (r): r is ShortTermResult => r !== null
@@ -690,6 +703,8 @@ export async function runAnalysis(universe: string[] = DEFAULT_UNIVERSE) {
     }));
   }
   shortTermRanked = shortTermRanked.sort((a, b) => b.score - a.score);
+
+  console.log(`[runAnalysis] hoàn tất sau ${Date.now() - t0}ms tổng, ${shortTermRanked.length}/${universe.length} mã thành công`);
 
   return {
     generatedAt: new Date().toISOString(),
