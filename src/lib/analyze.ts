@@ -1,8 +1,7 @@
 import os from "os";
 import path from "path";
 import { getVnstock } from "./vnstock-client";
-import { NextRequest, NextResponse } from "next/server";
-import { runAnalysis, DEFAULT_UNIVERSE, secondsUntilNextMarketOpen } from "@/lib/analyze";
+
 
 // Rổ mã mặc định để quét — có thể mở rộng sau (VN30 tiêu biểu, thanh khoản tốt)
 export const DEFAULT_UNIVERSE = [
@@ -16,39 +15,6 @@ export interface MarketBreadth {
   chg1d: number;
   chg5d: number;
   adjustment: number; // điểm cộng/trừ áp cho toàn bộ watchlist
-}
-export const runtime = "nodejs";
-// Dữ liệu thị trường đổi liên tục — không cache tĩnh ở build time.
-export const dynamic = "force-dynamic";
-// Tính nhiều chỉ báo hơn cho mỗi mã (SMA/Bollinger/ATR/SuperTrend) — nới thời gian chờ.
-export const maxDuration = 60;
- 
-export async function GET(req: NextRequest) {
-  const symbolsParam = req.nextUrl.searchParams.get("symbols");
-  const universe = symbolsParam
-    ? symbolsParam.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean)
-    : DEFAULT_UNIVERSE;
- 
-  try {
-    const result = await runAnalysis(universe);
- 
-    // Ngoài giờ giao dịch (đặc biệt cuối tuần), dữ liệu không đổi cho tới khi
-    // thị trường mở cửa lại — cache tới lúc đó ở edge CDN của Vercel, để các
-    // request cuối tuần được phục vụ từ cache thay vì gọi lại API bên ngoài
-    // mỗi lần (vốn có thể không ổn định ngoài giờ giao dịch).
-    const secondsToOpen = secondsUntilNextMarketOpen();
-    const maxAge = secondsToOpen > 0 ? Math.min(secondsToOpen + 300, 3 * 24 * 3600) : 900;
- 
-    return NextResponse.json(result, {
-      headers: { "Cache-Control": `s-maxage=${maxAge}, stale-while-revalidate=3600` },
-    });
-  } catch (err) {
-    console.error("GET /api/analyze failed:", err);
-    return NextResponse.json(
-      { error: "Không lấy được dữ liệu chứng khoán. Thử lại sau." },
-      { status: 502 }
-    );
-  }
 }
  
 
