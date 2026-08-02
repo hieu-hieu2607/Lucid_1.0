@@ -577,12 +577,10 @@ async function fetchMarketBreadth(): Promise<MarketBreadth | null> {
     const start = new Date();
     start.setDate(start.getDate() - 20);
 
-    let vni = await withRetry(() =>
-      stock.quote({
-        ticker: "VNINDEX",
-        start: start.toISOString().slice(0, 10),
-      })
-    );
+    let vni = await stock.quote({
+      ticker: "VNINDEX",
+      start: start.toISOString().slice(0, 10),
+    });
     vni = trimUnclosedBar(vni);
     if (!vni || vni.length < 6) return null;
 
@@ -617,7 +615,7 @@ async function fetchForeignFlow(universe: string[]): Promise<Map<string, number>
   const map = new Map<string, number>();
   try {
     const { Vnstock } = await getVnstock();
-    const board = await withRetry(() => new Vnstock().stock.trading.priceBoard(universe));
+    const board = await new Vnstock().stock.trading.priceBoard(universe);
     for (const row of board as Record<string, any>[]) {
       const buy = row.foreignBuyVolume ?? 0;
       const sell = row.foreignSellVolume ?? 0;
@@ -643,12 +641,10 @@ async function scoreShortTerm(
     const start = new Date();
     start.setDate(start.getDate() - 150); // ~5 tháng để SMA50/ATR/divergence đủ dữ liệu ổn định
 
-    let history = await withRetry(() =>
-      fns.stock.quote({
-        ticker,
-        start: start.toISOString().slice(0, 10),
-      })
-    );
+    let history = await fns.stock.quote({
+      ticker,
+      start: start.toISOString().slice(0, 10),
+    });
 
     if (!history || history.length < 55) return null;
 
