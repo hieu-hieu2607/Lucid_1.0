@@ -1,5 +1,5 @@
 import { getVnstock } from "./vnstock-client";
-import { computeScoreFromHistory, pctChange, trimUnclosedBar, withRetry, ShortTermResult } from "./analyze";
+import { computeScoreFromHistory, pctChange, trimUnclosedBar, ShortTermResult } from "./analyze";
 
 export interface RegressionCoefficient {
   name: string;
@@ -240,7 +240,7 @@ async function gatherSamples(
   start.setDate(start.getDate() - lookbackCalendarDays);
   const startStr = start.toISOString().slice(0, 10);
 
-  let vni = await withRetry(() => fns.stock.quote({ ticker: "VNINDEX", start: startStr }));
+  let vni = await fns.stock.quote({ ticker: "VNINDEX", start: startStr });
   vni = trimUnclosedBar(vni);
 
   function vniChg5dAt(history: { date: string }[], cutoff: number): number | null {
@@ -260,7 +260,7 @@ async function gatherSamples(
     const batchResults = await Promise.all(
       batch.map(async (ticker) => {
         try {
-          let h = await withRetry(() => fns.stock.quote({ ticker, start: startStr }));
+          let h = await fns.stock.quote({ ticker, start: startStr });
           h = trimUnclosedBar(h);
           return { ticker, history: h };
         } catch (err) {
