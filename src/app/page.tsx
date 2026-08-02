@@ -50,6 +50,28 @@ function fmt(n: number | null | undefined, digits = 1): string {
   return n.toFixed(digits);
 }
 
+/**
+ * fetch + parse JSON an toàn: khi server trả về lỗi không phải JSON (VD:
+ * trang HTML lỗi 504 timeout của Vercel), ném lỗi dễ hiểu thay vì để
+ * JSON.parse tự crash với thông báo khó hiểu.
+ */
+async function safeFetchJson(url: string): Promise<any> {
+  const res = await fetch(url);
+  const text = await res.text();
+  let json: any;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(
+      res.status === 504
+        ? "Yêu cầu quá lâu (vượt giới hạn thời gian của server) — thử lại hoặc giảm phạm vi dữ liệu."
+        : `Server trả về dữ liệu không hợp lệ (status ${res.status}): ${text.slice(0, 150)}`
+    );
+  }
+  if (!res.ok) throw new Error(json.error ?? "Có lỗi xảy ra");
+  return json;
+}
+
 function divergenceLabel(row: ShortTermResult): { text: string; color?: string } {
   const bull = row.rsiBullDiv || row.macdBullDiv;
   const bear = row.rsiBearDiv || row.macdBearDiv;
@@ -383,11 +405,9 @@ function BacktestPanel() {
     setBtError(null);
     setResult(null);
     try {
-      const res = await fetch(
+      const json = await safeFetchJson(
         `/api/backtest?ticker=${encodeURIComponent(ticker.trim())}&forwardDays=${forwardDays}`
       );
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error ?? "Lỗi backtest");
       setResult(json);
     } catch (e: any) {
       setBtError(e.message ?? "Có lỗi xảy ra");
@@ -539,9 +559,7 @@ function RegressionPanel() {
     setRgError(null);
     setResult(null);
     try {
-      const res = await fetch(`/api/regression?forwardDays=${forwardDays}`);
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error ?? "Lỗi hồi quy");
+      const json = await safeFetchJson(`/api/regression?forwardDays=${forwardDays}`);
       setResult(json);
     } catch (e: any) {
       setRgError(e.message ?? "Có lỗi xảy ra");
@@ -730,9 +748,7 @@ function TrainTestPanel() {
     setTtError(null);
     setResult(null);
     try {
-      const res = await fetch(`/api/train-test?forwardDays=${forwardDays}`);
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error ?? "Lỗi kiểm chứng");
+      const json = await safeFetchJson(`/api/train-test?forwardDays=${forwardDays}`);
       setResult(json);
     } catch (e: any) {
       setTtError(e.message ?? "Có lỗi xảy ra");
