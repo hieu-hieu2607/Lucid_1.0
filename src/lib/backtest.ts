@@ -1,5 +1,5 @@
 import { getVnstock } from "./vnstock-client";
-import { computeScoreFromHistory, pctChange, trimUnclosedBar, withRetry } from "./analyze";
+import { computeScoreFromHistory, pctChange, trimUnclosedBar } from "./analyze";
 
 export interface BacktestPoint {
   date: string;
@@ -66,11 +66,11 @@ export async function runBacktest(
   start.setDate(start.getDate() - lookbackCalendarDays);
   const startStr = start.toISOString().slice(0, 10);
 
-  let history = await withRetry(() => fns.stock.quote({ ticker, start: startStr }));
+  let history = await fns.stock.quote({ ticker, start: startStr });
   history = trimUnclosedBar(history);
   if (!history || history.length < 120) return null;
 
-  let vni = await withRetry(() => fns.stock.quote({ ticker: "VNINDEX", start: startStr }));
+  let vni = await fns.stock.quote({ ticker: "VNINDEX", start: startStr });
   vni = trimUnclosedBar(vni);
 
   // Map ngày -> giá đóng cửa VNINDEX, để tính sức mạnh tương đối tại từng mốc
