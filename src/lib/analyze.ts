@@ -52,6 +52,10 @@ export interface ShortTermResult {
   stopLoss: number | null;
   target1: number | null;
   riskReward: number | null; // (target1 - giá) / (giá - stopLoss)
+  // Chỉ để tham khảo — KHÔNG dùng trong công thức chấm điểm (xem ghi chú ở
+  // fetchFundamentals: không có lịch sử P/E/ROE nên không backtest được).
+  pe: number | null;
+  roe: number | null;
   reason: string;
 }
 
@@ -561,6 +565,8 @@ export function computeScoreFromHistory(
     stopLoss,
     target1,
     riskReward,
+    pe: null,
+    roe: null,
     reason: reasons.join("; ") || "Không đủ dữ liệu để đánh giá",
   };
 }
@@ -630,6 +636,36 @@ async function fetchForeignFlow(universe: string[]): Promise<Map<string, number>
   return map;
 }
 
+/**
+ * P/E, ROE hiện tại (ảnh chụp tại thời điểm gọi) — vnstock-js KHÔNG có lịch sử
+ * P/E/ROE theo từng ngày, nên 2 chỉ số này CHỈ dùng làm thông tin tham khảo
+ * hiển thị live, KHÔNG được đưa vào công thức chấm điểm hay backtest/hồi quy:
+ * dùng P/E hôm nay để "giải thích" return của 1 năm trước sẽ dính lỗi
+ * look-ahead bias (dùng thông tin tương lai để đánh giá quá khứ), đúng loại
+ * lỗi mà cả pipeline backtest/walk-forward trong app này được xây để tránh.
+ */
+async function fetchFundamentals(
+  universe: string[]
+): Promise<Map<string, { pe: number | null; roe: number | null }>> {
+  const map = new Map<string, { pe: number | null; roe: number | null }>();
+  try {
+    const { stock } = await getVnstock();
+    const rows = await stock.screening({ filters: [] });
+    const universeSet = new Set(universe.map((t) => t.toUpperCase()));
+    for (const row of rows as Record<string, any>[]) {
+      const ticker = String(row.ticker ?? row.symbol ?? "").toUpperCase();
+      if (!universeSet.has(ticker)) continue;
+      map.set(ticker, {
+        pe: typeof row.pe === "number" && row.pe > 0 ? row.pe : null,
+        roe: typeof row.roe === "number" ? row.roe : null,
+      });
+    }
+  } catch (err) {
+    console.error("fetchFundamentals failed:", err);
+  }
+  return map;
+}
+
 /** Wrapper: lấy dữ liệu mới nhất cho 1 mã rồi chấm điểm bằng computeScoreFromHistory. */
 async function scoreShortTerm(
   ticker: string,
@@ -667,12 +703,13 @@ export async function runAnalysis(universe: string[] = DEFAULT_UNIVERSE) {
   // os.homedir() không ghi được trên Vercel serverless — chỉ /tmp là ghi được.
   await init({ cacheDir: path.join(os.tmpdir(), "vnstock-js-cache") });
 
-  // Lấy VNINDEX + khối ngoại trước (cần cho mọi mã), rồi mới chấm điểm song song từng mã
-  const [marketBreadth, foreignFlow] = await Promise.all([
+  // Lấy VNINDEX + khối ngoại + P/E,ROE trước (cần cho mọi mã), rồi mới chấm điểm song song từng mã
+  const [marketBreadth, foreignFlow, fundamentals] = await Promise.all([
     fetchMarketBreadth(),
     fetchForeignFlow(universe),
+    fetchFundamentals(universe),
   ]);
-  console.log(`[runAnalysis] xong market breadth + khối ngoại sau ${Date.now() - t0}ms`);
+  console.log(`[runAnalysis] xong market breadth + khối ngoại + cơ bản sau ${Date.now() - t0}ms`);
 
   // Chia nhỏ theo từng đợt thay vì gọi tất cả cùng lúc. Log thực tế cho thấy:
   // 12 request đầu (2 đợt x 6) hoàn thành gần như tức thì, nhưng ngay đợt thứ 3
@@ -698,6 +735,12 @@ export async function runAnalysis(universe: string[] = DEFAULT_UNIVERSE) {
   let shortTermRanked = shortTermSettled.filter(
     (r): r is ShortTermResult => r !== null
   );
+
+  // Gắn P/E, ROE làm thông tin tham khảo — KHÔNG ảnh hưởng tới điểm/thứ hạng
+  shortTermRanked = shortTermRanked.map((r) => {
+    const f = fundamentals.get(r.ticker);
+    return f ? { ...r, pe: f.pe, roe: f.roe } : r;
+  });
 
   // Áp điều chỉnh market breadth cho toàn bộ watchlist rồi xếp hạng lại
   if (marketBreadth && marketBreadth.adjustment !== 0) {
