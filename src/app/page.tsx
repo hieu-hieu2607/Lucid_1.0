@@ -36,6 +36,8 @@ interface ShortTermResult {
   stopLoss: number | null;
   target1: number | null;
   riskReward: number | null;
+  pe: number | null;
+  roe: number | null;
   reason: string;
 }
 
@@ -187,6 +189,10 @@ export default function Home() {
             Xu hướng (SMA/SuperTrend/ADX) · Động lượng (RSI/MACD + phân kỳ) · Biến động (Bollinger/ATR) · Khối lượng · Khối ngoại · VNINDEX
           </span>
         </div>
+        <p className="text-xs text-[#5A6270] -mt-2">
+          * P/E, ROE là ảnh chụp hiện tại — chỉ để tham khảo thêm góc độ cơ bản, KHÔNG nằm trong công thức chấm điểm và
+          chưa qua backtest (vnstock-js không có lịch sử P/E/ROE theo ngày để kiểm chứng).
+        </p>
 
         {loading && !best && (
           <div className="text-sm text-[#5A6270] font-[var(--font-mono)] animate-pulse">
@@ -273,6 +279,8 @@ export default function Home() {
                 value={best.riskReward !== null ? `1:${fmt(best.riskReward, 1)}` : "—"}
                 color={best.riskReward !== null && best.riskReward >= 2 ? ACCENT : NEUTRAL}
               />
+              <Stat label="P/E (chỉ tham khảo)" value={fmt(best.pe)} />
+              <Stat label="ROE (chỉ tham khảo)" value={best.roe !== null ? `${fmt(best.roe * 100)}%` : "—"} />
             </div>
           </div>
         )}
@@ -282,7 +290,7 @@ export default function Home() {
             <table className="w-full text-sm font-[var(--font-mono)]">
               <thead>
                 <tr className="text-[#5A6270] text-xs">
-                  {["Mã", "Giá", "Điểm", "RSI", "MACD", "Phân kỳ", "Xu hướng", "ADX", "%B", "ATR%", "KL/TB20", "Ngoại%", "RS 5p", "Δ 5 phiên", "R:R"].map((h) => (
+                  {["Mã", "Giá", "Điểm", "RSI", "MACD", "Phân kỳ", "Xu hướng", "ADX", "%B", "ATR%", "KL/TB20", "Ngoại%", "RS 5p", "Δ 5 phiên", "R:R", "P/E*", "ROE*"].map((h) => (
                     <th key={h} className="text-left font-normal px-3 py-2 border-b border-[#1F252E]">
                       {h}
                     </th>
@@ -340,6 +348,10 @@ export default function Home() {
                       <td className="px-3 py-2 text-[#C4CBD4]">{fmt(row.priceChange5d)}%</td>
                       <td className="px-3 py-2 text-[#C4CBD4]">
                         {row.riskReward !== null ? `1:${fmt(row.riskReward, 1)}` : "—"}
+                      </td>
+                      <td className="px-3 py-2 text-[#7C8797]">{fmt(row.pe)}</td>
+                      <td className="px-3 py-2 text-[#7C8797]">
+                        {row.roe !== null ? `${fmt(row.roe * 100)}%` : "—"}
                       </td>
                     </tr>
                   );
