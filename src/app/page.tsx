@@ -353,6 +353,7 @@ export default function Home() {
         <RegressionPanel />
         <TrainTestPanel />
         <RidgeSweepPanel />
+        <WalkForwardPanel />
       </section>
 
       <footer className="border-t border-[#1F252E] px-6 py-3 text-xs text-[#5A6270] flex items-center justify-between">
@@ -1067,6 +1068,171 @@ function RidgeSweepPanel() {
 
           <p className="text-xs text-[#5A6270]">
             Bấm vào 1 dòng bất kỳ để xem chi tiết bảng nhóm Q1-Q4 ứng với mức λ đó. Không phải khuyến nghị đầu tư.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface WalkForwardFold {
+  foldIndex: number;
+  trainCount: number;
+  testCount: number;
+  testDateRange: [string, string];
+  oosR2: number;
+  oosCorrelation: number | null;
+  q1ReturnPct: number;
+  q4ReturnPct: number;
+  q4BeatsQ1: boolean;
+}
+
+interface WalkForwardResult {
+  tickers: string[];
+  forwardDays: number;
+  numFolds: number;
+  folds: WalkForwardFold[];
+  consistentDirectionPct: number;
+  avgOosR2: number;
+}
+
+function WalkForwardPanel() {
+  const [forwardDays, setForwardDays] = useState(5);
+  const [result, setResult] = useState<WalkForwardResult | null>(null);
+  const [wfError, setWfError] = useState<string | null>(null);
+  const [wfLoading, setWfLoading] = useState(false);
+
+  async function runWalkForward() {
+    setWfLoading(true);
+    setWfError(null);
+    setResult(null);
+    try {
+      const json = await safeFetchJson(`/api/walk-forward?forwardDays=${forwardDays}&numFolds=5`);
+      setResult(json);
+    } catch (e: any) {
+      setWfError(e.message ?? "Có lỗi xảy ra");
+    } finally {
+      setWfLoading(false);
+    }
+  }
+
+  return (
+    <div className="rounded-xl border border-[#1F252E] p-5 flex flex-col gap-4">
+      <div>
+        <div className="text-xs font-semibold tracking-[0.15em] font-[var(--font-mono)] text-[#B7C0CC]">
+          WALK-FORWARD VALIDATION (NHIỀU CỬA SỔ THEO THỜI GIAN)
+        </div>
+        <p className="text-xs text-[#5A6270] mt-1 max-w-2xl">
+          Thay vì 1 lần chia train/test, chia dữ liệu ~2.5 năm thành 5 cửa sổ liên tiếp. Ở mỗi cửa sổ,
+          train trên TOÀN BỘ dữ liệu trước đó, test trên đoạn tiếp theo. Nếu việc Q4 (dự đoán cao) thua
+          Q1 (dự đoán thấp) LẶP LẠI đều đặn qua nhiều cửa sổ, đó là bằng chứng thị trường đang đổi pha
+          liên tục — không phải may rủi của 1 lần chia.
+        </p>
+      </div>
+
+      <div className="flex items-center gap-2 flex-wrap">
+        <div className="flex items-center gap-1 text-xs text-[#7C8797]">
+          <span>Dự báo</span>
+          {[5, 10, 20].map((d) => (
+            <button
+              key={d}
+              onClick={() => setForwardDays(d)}
+              className="px-2 py-1 rounded border font-[var(--font-mono)] transition-colors"
+              style={{
+                borderColor: forwardDays === d ? NEUTRAL : "#262C36",
+                color: forwardDays === d ? NEUTRAL : "#7C8797",
+              }}
+            >
+              {d}p
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={runWalkForward}
+          disabled={wfLoading}
+          className="text-sm px-3 py-1.5 rounded-md border border-[#262C36] hover:border-[#3A4250] text-[#B7C0CC] disabled:opacity-50 transition-colors"
+        >
+          {wfLoading ? "Đang chạy (có thể mất 30-50s)…" : "Chạy walk-forward"}
+        </button>
+      </div>
+
+      {wfError && (
+        <div className="rounded-md border border-[#EA394340] bg-[#EA39430D] px-4 py-2 text-sm text-[#F2A5A9]">
+          {wfError}
+        </div>
+      )}
+
+      {result && (
+        <div className="flex flex-col gap-3">
+          <div className="grid grid-cols-2 gap-3">
+            <Stat
+              label="% cửa sổ mà Q4 thắng Q1"
+              value={`${fmt(result.consistentDirectionPct, 0)}%`}
+              color={result.consistentDirectionPct >= 60 ? ACCENT : result.consistentDirectionPct <= 40 ? DOWN : NEUTRAL}
+            />
+            <Stat
+              label="R² ngoài mẫu trung bình"
+              value={`${(result.avgOosR2 * 100).toFixed(1)}%`}
+              color={result.avgOosR2 > 0 ? ACCENT : DOWN}
+            />
+          </div>
+
+          <div
+            className="rounded-md border px-4 py-2 text-xs"
+            style={{
+              borderColor: `${result.consistentDirectionPct <= 40 ? DOWN : result.consistentDirectionPct >= 60 ? ACCENT : NEUTRAL}40`,
+              background: `${result.consistentDirectionPct <= 40 ? DOWN : result.consistentDirectionPct >= 60 ? ACCENT : NEUTRAL}0D`,
+              color: result.consistentDirectionPct <= 40 ? DOWN : result.consistentDirectionPct >= 60 ? ACCENT : NEUTRAL,
+            }}
+          >
+            {result.consistentDirectionPct >= 60
+              ? "Q4 thắng Q1 ở đa số cửa sổ — có dấu hiệu tín hiệu ổn định qua thời gian, đáng để tìm hiểu sâu hơn."
+              : result.consistentDirectionPct <= 40
+              ? "Q4 THUA Q1 ở đa số cửa sổ — mô hình đảo chiều lặp lại nhất quán, không phải ngẫu nhiên của 1 lần chia. Bằng chứng mạnh cho thấy các chỉ báo này không mang tín hiệu ổn định (hoặc mang tín hiệu NGƯỢC) ở khung thời gian này."
+              : "Kết quả không nhất quán qua các cửa sổ (gần 50/50) — giống với việc thị trường đổi pha liên tục, mô hình tuyến tính cố định khó bắt được."}
+          </div>
+
+          <div className="overflow-x-auto rounded-lg border border-[#1F252E]">
+            <table className="w-full text-sm font-[var(--font-mono)]">
+              <thead>
+                <tr className="text-[#5A6270] text-xs">
+                  {["Cửa sổ", "Giai đoạn test", "R² ngoài mẫu", "Q1 thực tế", "Q4 thực tế", "Q4 > Q1?"].map((h) => (
+                    <th key={h} className="text-left font-normal px-3 py-2 border-b border-[#1F252E]">
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {result.folds.map((f) => (
+                  <tr key={f.foldIndex} className="border-b border-[#161B22] last:border-0">
+                    <td className="px-3 py-2 text-[#E7EAEE]">#{f.foldIndex}</td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">
+                      {f.testDateRange[0]} → {f.testDateRange[1]}
+                    </td>
+                    <td className="px-3 py-2" style={{ color: f.oosR2 > 0 ? ACCENT : DOWN }}>
+                      {(f.oosR2 * 100).toFixed(1)}%
+                    </td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">
+                      {f.q1ReturnPct >= 0 ? "+" : ""}
+                      {fmt(f.q1ReturnPct)}%
+                    </td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">
+                      {f.q4ReturnPct >= 0 ? "+" : ""}
+                      {fmt(f.q4ReturnPct)}%
+                    </td>
+                    <td className="px-3 py-2" style={{ color: f.q4BeatsQ1 ? ACCENT : DOWN }}>
+                      {f.q4BeatsQ1 ? "Có" : "Không"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <p className="text-xs text-[#5A6270]">
+            Mỗi cửa sổ train trên toàn bộ dữ liệu trước nó (expanding window), test trên đoạn kế tiếp mà mô
+            hình chưa từng thấy. Không phải khuyến nghị đầu tư.
           </p>
         </div>
       )}
