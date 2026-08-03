@@ -232,10 +232,10 @@ interface Sample {
  */
 async function gatherSamples(
   tickers: string[],
-  forwardDays: number
+  forwardDays: number,
+  lookbackCalendarDays = 500
 ): Promise<{ samples: Sample[]; histories: { ticker: string; history: any }[] }> {
   const fns = await getVnstock();
-  const lookbackCalendarDays = 500;
   const start = new Date();
   start.setDate(start.getDate() - lookbackCalendarDays);
   const startStr = start.toISOString().slice(0, 10);
@@ -251,11 +251,14 @@ async function gatherSamples(
     return pctChange(vni[idx - 5].close, vni[idx].close);
   }
 
-  // Lấy dữ liệu 500 ngày cho 20 mã CÙNG LÚC dễ khiến nguồn dữ liệu chậm/timeout
-  // một phần do payload lớn — chia thành từng đợt nhỏ (5 mã/đợt) để ổn định hơn.
-  const BATCH_SIZE = 5;
+  // Lấy dữ liệu nhiều ngày cho 20 mã CÙNG LÚC dễ khiến nguồn dữ liệu chậm/bị
+  // giới hạn tốc độ — chia thành từng đợt nhỏ (3 mã/đợt) + nghỉ giữa các đợt
+  // để ổn định hơn (giống cách đã sửa cho /api/analyze).
+  const BATCH_SIZE = 3;
+  const BATCH_DELAY_MS = 400;
   const histories: { ticker: string; history: any }[] = [];
   for (let i = 0; i < tickers.length; i += BATCH_SIZE) {
+    if (i > 0) await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY_MS));
     const batch = tickers.slice(i, i + BATCH_SIZE);
     const batchResults = await Promise.all(
       batch.map(async (ticker) => {
@@ -562,5 +565,112 @@ export async function runRidgeSweep(
     trainCount: train.length,
     testCount: test.length,
     points,
+  };
+}
+
+export interface WalkForwardFold {
+  foldIndex: number;
+  trainCount: number;
+  testCount: number;
+  testDateRange: [string, string];
+  oosR2: number;
+  oosCorrelation: number | null;
+  q1ReturnPct: number;
+  q4ReturnPct: number;
+  q4BeatsQ1: boolean;
+}
+
+export interface WalkForwardResult {
+  tickers: string[];
+  forwardDays: number;
+  numFolds: number;
+  folds: WalkForwardFold[];
+  consistentDirectionPct: number; // % số fold mà Q4 (dự đoán cao) thắng Q1 (dự đoán thấp)
+  avgOosR2: number;
+}
+
+/**
+ * Walk-forward validation: thay vì tách 1 lần train/test duy nhất, chia dữ
+ * liệu theo thời gian thành nhiều "cửa sổ" (fold) liên tiếp. Ở fold thứ f,
+ * train trên TOÀN BỘ dữ liệu trước đó (expanding window), test trên đoạn
+ * tiếp theo — lặp lại nhiều lần. Nếu việc đảo chiều (Q4 tệ hơn Q1) chỉ là
+ * ngẫu nhiên của riêng 1 giai đoạn, các fold sẽ cho kết quả khác nhau thất
+ * thường. Nếu đảo chiều LẶP LẠI đều đặn qua nhiều fold, đó là bằng chứng
+ * mạnh cho thấy thị trường đang đổi pha (regime) liên tục — không phải may
+ * rủi của 1 lần chia.
+ */
+export async function runWalkForward(
+  tickers: string[],
+  forwardDays = 5,
+  numFolds = 5,
+  lookbackCalendarDays = 900
+): Promise<WalkForwardResult | null> {
+  const { samples } = await gatherSamples(tickers, forwardDays, lookbackCalendarDays);
+  if (samples.length < FEATURES.length * 15) return null;
+
+  const sorted = [...samples].sort((a, b) => a.date.localeCompare(b.date));
+  const n = sorted.length;
+  const foldSize = Math.floor(n / numFolds);
+  if (foldSize < 20) return null; // mỗi fold cần đủ mẫu để có ý nghĩa
+
+  const folds: WalkForwardFold[] = [];
+
+  for (let f = 1; f < numFolds; f++) {
+    const trainEnd = f * foldSize;
+    const testStart = trainEnd;
+    const testEnd = f === numFolds - 1 ? n : (f + 1) * foldSize;
+
+    const train = sorted.slice(0, trainEnd);
+    const test = sorted.slice(testStart, testEnd);
+    if (train.length < FEATURES.length * 10 || test.length < 15) continue;
+
+    const fit = ols(
+      train.map((s) => s.features),
+      train.map((s) => s.forwardReturn)
+    );
+    if (!fit) continue;
+
+    const testX = test.map((s) => s.features);
+    const testY = test.map((s) => s.forwardReturn);
+    const predY = testX.map((x) => x.reduce((s, xi, i) => s + xi * fit.coefs[i], 0));
+
+    const testMean = testY.reduce((a, b) => a + b, 0) / testY.length;
+    let ssRes = 0;
+    let ssTot = 0;
+    for (let i = 0; i < testY.length; i++) {
+      ssRes += (testY[i] - predY[i]) ** 2;
+      ssTot += (testY[i] - testMean) ** 2;
+    }
+    const oosR2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
+    const oosCorrelation = pearsonCorrelation(predY, testY);
+    const buckets = quantileBuckets(predY, testY, 4);
+    const q1 = buckets[0];
+    const q4 = buckets.at(-1);
+
+    folds.push({
+      foldIndex: f,
+      trainCount: train.length,
+      testCount: test.length,
+      testDateRange: [test[0].date, test.at(-1)!.date],
+      oosR2,
+      oosCorrelation,
+      q1ReturnPct: q1?.avgActualReturnPct ?? 0,
+      q4ReturnPct: q4?.avgActualReturnPct ?? 0,
+      q4BeatsQ1: (q4?.avgActualReturnPct ?? 0) > (q1?.avgActualReturnPct ?? 0),
+    });
+  }
+
+  if (folds.length === 0) return null;
+
+  const consistentDirectionPct = (folds.filter((f) => f.q4BeatsQ1).length / folds.length) * 100;
+  const avgOosR2 = folds.reduce((s, f) => s + f.oosR2, 0) / folds.length;
+
+  return {
+    tickers,
+    forwardDays,
+    numFolds: folds.length,
+    folds,
+    consistentDirectionPct,
+    avgOosR2,
   };
 }
