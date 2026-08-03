@@ -447,3 +447,120 @@ export async function runTrainTestSplit(
     buckets,
   };
 }
+
+export interface RidgeSweepPoint {
+  lambda: number;
+  trainR2: number;
+  oosR2: number;
+  oosCorrelation: number | null;
+  buckets: TrainTestBucket[];
+}
+
+export interface RidgeSweepResult {
+  tickers: string[];
+  forwardDays: number;
+  trainCount: number;
+  testCount: number;
+  points: RidgeSweepPoint[];
+}
+
+/**
+ * Ridge regression (hồi quy có điều chuẩn L2): giống OLS nhưng cộng thêm
+ * lambda vào đường chéo của XtX (trừ hằng số/intercept — không điều chuẩn nó)
+ * trước khi giải hệ. lambda càng lớn, hệ số càng bị ép về gần 0 — giảm nguy cơ
+ * mô hình "học thuộc lòng" nhiễu ngẫu nhiên của tập train, đánh đổi lấy độ
+ * chệch (bias) tăng nhẹ. Không có công thức tính lambda tối ưu trước — cần
+ * quét qua nhiều giá trị và xem cái nào cho R² ngoài mẫu tốt nhất (đó là việc
+ * runRidgeSweep làm).
+ */
+function ridgeFit(X: number[][], y: number[], lambda: number): { coefs: number[]; r2: number } | null {
+  const n = X.length;
+  const p = X[0].length;
+  const XtX: number[][] = Array.from({ length: p }, () => new Array(p).fill(0));
+  const XtY: number[] = new Array(p).fill(0);
+
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < p; j++) {
+      XtY[j] += X[i][j] * y[i];
+      for (let k = 0; k < p; k++) {
+        XtX[j][k] += X[i][j] * X[i][k];
+      }
+    }
+  }
+  // Cộng lambda vào đường chéo — bỏ qua vị trí 0 (hằng số), theo quy ước
+  // chuẩn của ridge regression là không điều chuẩn intercept.
+  for (let j = 1; j < p; j++) XtX[j][j] += lambda;
+
+  const inv = invertMatrix(XtX);
+  if (!inv) return null;
+  const coefs = inv.map((row) => row.reduce((s, v, j) => s + v * XtY[j], 0));
+
+  const yMean = y.reduce((a, b) => a + b, 0) / n;
+  let ssTot = 0;
+  let ssRes = 0;
+  for (let i = 0; i < n; i++) {
+    const pred = X[i].reduce((s, xij, j) => s + xij * coefs[j], 0);
+    ssRes += (y[i] - pred) ** 2;
+    ssTot += (y[i] - yMean) ** 2;
+  }
+  const r2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
+  return { coefs, r2 };
+}
+
+/**
+ * Quét qua nhiều mức lambda, fit ridge trên CÙNG tập train, đánh giá trên
+ * CÙNG tập test (out-of-sample) như runTrainTestSplit — để xem điều chuẩn có
+ * thực sự cải thiện khả năng khái quát hoá hay không, và mức lambda nào cân
+ * bằng tốt nhất. lambda=0 tương đương OLS thường (không điều chuẩn) — dùng
+ * làm mốc so sánh.
+ */
+export async function runRidgeSweep(
+  tickers: string[],
+  forwardDays = 5,
+  trainFraction = 0.7,
+  lambdas: number[] = [0, 1, 5, 20, 50, 100, 200]
+): Promise<RidgeSweepResult | null> {
+  const { samples } = await gatherSamples(tickers, forwardDays);
+  if (samples.length < FEATURES.length * 20) return null;
+
+  const sorted = [...samples].sort((a, b) => a.date.localeCompare(b.date));
+  const splitIdx = Math.floor(sorted.length * trainFraction);
+  const train = sorted.slice(0, splitIdx);
+  const test = sorted.slice(splitIdx);
+  if (train.length < FEATURES.length * 10 || test.length < 20) return null;
+
+  const trainX = train.map((s) => s.features);
+  const trainY = train.map((s) => s.forwardReturn);
+  const testX = test.map((s) => s.features);
+  const testY = test.map((s) => s.forwardReturn);
+
+  const points: RidgeSweepPoint[] = [];
+  for (const lambda of lambdas) {
+    const fit = ridgeFit(trainX, trainY, lambda);
+    if (!fit) continue;
+
+    const predY = testX.map((x) => x.reduce((s, xi, i) => s + xi * fit.coefs[i], 0));
+    const testMean = testY.reduce((a, b) => a + b, 0) / testY.length;
+    let ssRes = 0;
+    let ssTot = 0;
+    for (let i = 0; i < testY.length; i++) {
+      ssRes += (testY[i] - predY[i]) ** 2;
+      ssTot += (testY[i] - testMean) ** 2;
+    }
+    const oosR2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
+    const oosCorrelation = pearsonCorrelation(predY, testY);
+    const buckets = quantileBuckets(predY, testY, 4);
+
+    points.push({ lambda, trainR2: fit.r2, oosR2, oosCorrelation, buckets });
+  }
+
+  if (points.length === 0) return null;
+
+  return {
+    tickers,
+    forwardDays,
+    trainCount: train.length,
+    testCount: test.length,
+    points,
+  };
+}
