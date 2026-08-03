@@ -352,6 +352,7 @@ export default function Home() {
         <BacktestPanel />
         <RegressionPanel />
         <TrainTestPanel />
+        <RidgeSweepPanel />
       </section>
 
       <footer className="border-t border-[#1F252E] px-6 py-3 text-xs text-[#5A6270] flex items-center justify-between">
@@ -889,6 +890,183 @@ function TrainTestPanel() {
             fit. Nếu R² ngoài mẫu gần 0 hoặc âm, kết luận hợp lý là bộ chỉ báo hiện tại không đủ sức dự
             đoán return ngắn hạn cho nhóm cổ phiếu này — đó là một kết luận khoa học hợp lệ, không phải
             thất bại của việc xây dựng hệ thống. Không phải khuyến nghị đầu tư.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface RidgeSweepPoint {
+  lambda: number;
+  trainR2: number;
+  oosR2: number;
+  oosCorrelation: number | null;
+  buckets: TrainTestBucket[];
+}
+
+interface RidgeSweepResult {
+  tickers: string[];
+  forwardDays: number;
+  trainCount: number;
+  testCount: number;
+  points: RidgeSweepPoint[];
+}
+
+function RidgeSweepPanel() {
+  const [forwardDays, setForwardDays] = useState(5);
+  const [result, setResult] = useState<RidgeSweepResult | null>(null);
+  const [rsError, setRsError] = useState<string | null>(null);
+  const [rsLoading, setRsLoading] = useState(false);
+  const [selectedLambda, setSelectedLambda] = useState<number | null>(null);
+
+  async function runSweep() {
+    setRsLoading(true);
+    setRsError(null);
+    setResult(null);
+    setSelectedLambda(null);
+    try {
+      const json = await safeFetchJson(`/api/ridge?forwardDays=${forwardDays}`);
+      setResult(json);
+      const best = [...json.points].sort((a: RidgeSweepPoint, b: RidgeSweepPoint) => b.oosR2 - a.oosR2)[0];
+      setSelectedLambda(best?.lambda ?? null);
+    } catch (e: any) {
+      setRsError(e.message ?? "Có lỗi xảy ra");
+    } finally {
+      setRsLoading(false);
+    }
+  }
+
+  const bestPoint = result?.points.find((p) => p.lambda === selectedLambda) ?? null;
+  const olsPoint = result?.points.find((p) => p.lambda === 0) ?? null;
+
+  return (
+    <div className="rounded-xl border border-[#1F252E] p-5 flex flex-col gap-4">
+      <div>
+        <div className="text-xs font-semibold tracking-[0.15em] font-[var(--font-mono)] text-[#B7C0CC]">
+          RIDGE REGRESSION — QUÉT ĐIỀU CHUẨN (λ)
+        </div>
+        <p className="text-xs text-[#5A6270] mt-1 max-w-2xl">
+          Fit lại mô hình với nhiều mức điều chuẩn λ khác nhau trên CÙNG tập train/test như mục Train/Test
+          ở trên (λ=0 = OLS thường, không điều chuẩn). λ càng lớn, hệ số càng bị ép về 0 — giảm nguy cơ học
+          thuộc lòng nhiễu của tập train. Xem R² ngoài mẫu (test) đổi thế nào theo từng mức λ.
+        </p>
+      </div>
+
+      <div className="flex items-center gap-2 flex-wrap">
+        <div className="flex items-center gap-1 text-xs text-[#7C8797]">
+          <span>Dự báo</span>
+          {[5, 10, 20].map((d) => (
+            <button
+              key={d}
+              onClick={() => setForwardDays(d)}
+              className="px-2 py-1 rounded border font-[var(--font-mono)] transition-colors"
+              style={{
+                borderColor: forwardDays === d ? NEUTRAL : "#262C36",
+                color: forwardDays === d ? NEUTRAL : "#7C8797",
+              }}
+            >
+              {d}p
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={runSweep}
+          disabled={rsLoading}
+          className="text-sm px-3 py-1.5 rounded-md border border-[#262C36] hover:border-[#3A4250] text-[#B7C0CC] disabled:opacity-50 transition-colors"
+        >
+          {rsLoading ? "Đang chạy (có thể mất 20-40s)…" : "Chạy Ridge sweep"}
+        </button>
+      </div>
+
+      {rsError && (
+        <div className="rounded-md border border-[#EA394340] bg-[#EA39430D] px-4 py-2 text-sm text-[#F2A5A9]">
+          {rsError}
+        </div>
+      )}
+
+      {result && (
+        <div className="flex flex-col gap-3">
+          <div className="text-sm text-[#9AA4B2]">
+            Train: {result.trainCount} mẫu · Test: {result.testCount} mẫu · dự báo {result.forwardDays} phiên tới
+          </div>
+
+          <div className="overflow-x-auto rounded-lg border border-[#1F252E]">
+            <table className="w-full text-sm font-[var(--font-mono)]">
+              <thead>
+                <tr className="text-[#5A6270] text-xs">
+                  {["λ", "R² train", "R² ngoài mẫu", "Tương quan ngoài mẫu", ""].map((h) => (
+                    <th key={h} className="text-left font-normal px-3 py-2 border-b border-[#1F252E]">
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {result.points.map((p) => (
+                  <tr
+                    key={p.lambda}
+                    className="border-b border-[#161B22] last:border-0 cursor-pointer hover:bg-white/[0.02]"
+                    onClick={() => setSelectedLambda(p.lambda)}
+                  >
+                    <td className="px-3 py-2 text-[#E7EAEE]">{p.lambda === 0 ? "0 (OLS)" : p.lambda}</td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">{(p.trainR2 * 100).toFixed(1)}%</td>
+                    <td className="px-3 py-2" style={{ color: p.oosR2 > 0 ? ACCENT : DOWN }}>
+                      {(p.oosR2 * 100).toFixed(1)}%
+                    </td>
+                    <td className="px-3 py-2 text-[#C4CBD4]">
+                      {p.oosCorrelation !== null ? p.oosCorrelation.toFixed(2) : "—"}
+                    </td>
+                    <td className="px-3 py-2 text-xs" style={{ color: p.lambda === selectedLambda ? NEUTRAL : "#5A6270" }}>
+                      {p.lambda === selectedLambda ? "★ tốt nhất (test)" : ""}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {olsPoint && bestPoint && bestPoint.lambda !== 0 && (
+            <p className="text-xs text-[#9AA4B2]">
+              So với OLS (λ=0, R² ngoài mẫu {(olsPoint.oosR2 * 100).toFixed(1)}%), λ={bestPoint.lambda} cho R² ngoài
+              mẫu {(bestPoint.oosR2 * 100).toFixed(1)}%
+              {bestPoint.oosR2 > olsPoint.oosR2
+                ? " — điều chuẩn thực sự giúp cải thiện khả năng khái quát hoá."
+                : " — điều chuẩn không giúp cải thiện nhiều; nhiều khả năng vấn đề không nằm ở việc mô hình quá phức tạp, mà ở việc bản thân các chỉ báo không mang tín hiệu dự đoán thực sự."}
+            </p>
+          )}
+
+          {bestPoint && (
+            <div className="overflow-x-auto rounded-lg border border-[#1F252E]">
+              <table className="w-full text-sm font-[var(--font-mono)]">
+                <thead>
+                  <tr className="text-[#5A6270] text-xs">
+                    {["Nhóm (λ tốt nhất)", "Số mẫu", "Return thực tế TB", "Tỷ lệ thắng"].map((h) => (
+                      <th key={h} className="text-left font-normal px-3 py-2 border-b border-[#1F252E]">
+                        {h}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {bestPoint.buckets.map((b) => (
+                    <tr key={b.label} className="border-b border-[#161B22] last:border-0">
+                      <td className="px-3 py-2 text-[#E7EAEE]">{b.label}</td>
+                      <td className="px-3 py-2 text-[#C4CBD4]">{b.count}</td>
+                      <td className="px-3 py-2" style={{ color: b.avgActualReturnPct >= 0 ? ACCENT : DOWN }}>
+                        {b.avgActualReturnPct >= 0 ? "+" : ""}
+                        {fmt(b.avgActualReturnPct)}%
+                      </td>
+                      <td className="px-3 py-2 text-[#C4CBD4]">{fmt(b.winRatePct, 0)}%</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          <p className="text-xs text-[#5A6270]">
+            Bấm vào 1 dòng bất kỳ để xem chi tiết bảng nhóm Q1-Q4 ứng với mức λ đó. Không phải khuyến nghị đầu tư.
           </p>
         </div>
       )}
